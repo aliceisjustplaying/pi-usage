@@ -8,6 +8,8 @@ import {
   formatWidget,
   parseAnthropicUsage,
   parseCodexUsage,
+  parseGrokUsage,
+  parseGrokUserId,
 } from "../index.ts";
 
 test("parses Anthropic legacy usage buckets", () => {
@@ -106,6 +108,61 @@ test("parses only Codex shared limits and ignores additional meters", () => {
   );
 });
 
+test("parses Grok weekly credits, fresh periods, and legacy monthly fallback", () => {
+  assert.deepEqual(
+    parseGrokUsage({
+      config: {
+        creditUsagePercent: 42.5,
+        currentPeriod: {
+          type: "USAGE_PERIOD_TYPE_WEEKLY",
+          end: "2026-08-17T12:51:17Z",
+        },
+      },
+    }),
+    [{ label: "Week", usedPercent: 42.5, resetsAt: Date.parse("2026-08-17T12:51:17Z") }],
+  );
+  assert.deepEqual(
+    parseGrokUsage({
+      config: {
+        currentPeriod: {
+          type: "USAGE_PERIOD_TYPE_WEEKLY",
+          end: "2026-08-17T12:51:17Z",
+        },
+      },
+    }),
+    [{ label: "Week", usedPercent: 0, resetsAt: Date.parse("2026-08-17T12:51:17Z") }],
+  );
+  assert.deepEqual(
+    parseGrokUsage({
+      config: {
+        creditUsagePercent: 101,
+        currentPeriod: {
+          type: "USAGE_PERIOD_TYPE_WEEKLY",
+          end: "2026-08-17T12:51:17Z",
+        },
+      },
+    }),
+    [{ label: "Week", usedPercent: undefined, resetsAt: Date.parse("2026-08-17T12:51:17Z") }],
+  );
+  assert.deepEqual(
+    parseGrokUsage({
+      config: {
+        used: { val: 250 },
+        monthlyLimit: { val: 1000 },
+        billingPeriodEnd: "2026-09-01T00:00:00Z",
+      },
+    }),
+    [{ label: "Month", usedPercent: 25, resetsAt: Date.parse("2026-09-01T00:00:00Z") }],
+  );
+});
+
+test("accepts only bounded header-safe Grok user IDs", () => {
+  assert.equal(parseGrokUserId({ userId: "user-123" }), "user-123");
+  assert.equal(parseGrokUserId({ userId: "user\r\nx-userid: attacker" }), undefined);
+  assert.equal(parseGrokUserId({ userId: "x".repeat(257) }), undefined);
+  assert.equal(parseGrokUserId({}), undefined);
+});
+
 test("handles malformed and partial payloads", () => {
   assert.equal(parseAnthropicUsage(null), null);
   assert.equal(parseAnthropicUsage({ limits: [{ kind: "weekly_scoped", percent: 50 }] }), null);
@@ -125,6 +182,9 @@ test("handles malformed and partial payloads", () => {
     }),
     null,
   );
+  assert.equal(parseGrokUsage(null), null);
+  assert.equal(parseGrokUsage({ config: null }), null);
+  assert.equal(parseGrokUsage({ config: { creditUsagePercent: 101 } }), null);
 });
 
 test("sanitizes provider-controlled labels before rendering", () => {
@@ -165,9 +225,10 @@ test("formats compact bars, percentages, countdowns, and partial provider states
       {
         anthropic: { kind: "ready", windows: [{ label: "Fable", usedPercent: 100 }] },
         codex: { kind: "error", message: "HTTP 429" },
+        grok: { kind: "login", command: "/login xai-auth" },
       },
       now,
     ),
-    ["Claude: Fable █████ 100% │ Codex: HTTP 429"],
+    ["Claude: Fable █████ 100%", "Codex: HTTP 429 │ Grok: /login xai-auth"],
   );
 });

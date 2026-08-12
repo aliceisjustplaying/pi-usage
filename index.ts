@@ -4,6 +4,9 @@ const WIDGET_ID = "pi-usage";
 const REFRESH_INTERVAL_MS = 60_000;
 const REQUEST_TIMEOUT_MS = 8_000;
 const CODEX_FALLBACK_BASE_URL = "https://chatgpt.com/backend-api";
+const GROK_BASE_URL = "https://cli-chat-proxy.grok.com/v1";
+const GROK_CLIENT_VERSION = "1.0.3";
+const MAX_RESPONSE_BYTES = 64 * 1024;
 
 type UnknownRecord = Record<string, unknown>;
 
@@ -24,13 +27,14 @@ export interface ProviderAuthResult {
 
 type ProviderState =
   | { kind: "loading" }
-  | { kind: "login" }
+  | { kind: "login"; command?: string }
   | { kind: "error"; message: string }
   | { kind: "ready"; windows: UsageWindow[] };
 
 export interface UsageState {
   anthropic: ProviderState;
   codex: ProviderState;
+  grok: ProviderState;
 }
 
 function isRecord(value: unknown): value is UnknownRecord {
@@ -168,6 +172,49 @@ export function parseCodexUsage(payload: unknown, nowMs = Date.now()): UsageWind
   return windows.length > 0 ? windows : null;
 }
 
+function centsValue(value: unknown): number | undefined {
+  if (!isRecord(value)) return undefined;
+  const cents = value.val === undefined ? 0 : finiteNumber(value.val);
+  return cents !== undefined && cents >= 0 ? cents : undefined;
+}
+
+/** Parse Grok's current weekly credits format with the legacy monthly fallback. */
+export function parseGrokUsage(payload: unknown): UsageWindow[] | null {
+  if (!isRecord(payload) || !isRecord(payload.config)) return null;
+  const config = payload.config;
+  const period = isRecord(config.currentPeriod) ? config.currentPeriod : undefined;
+  const periodType = typeof period?.type === "string" ? period.type.toUpperCase() : "";
+  const hasLegacyAmounts = config.used !== undefined || config.monthlyLimit !== undefined;
+  const label = periodType.includes("MONTHLY") || (!period && hasLegacyAmounts) ? "Month" : "Week";
+  const resetsAt = parseResetTime(period?.end ?? config.billingPeriodEnd);
+
+  const percentWasOmitted = config.creditUsagePercent === undefined;
+  let usedPercent = finiteNumber(config.creditUsagePercent);
+  if (usedPercent !== undefined && (usedPercent < 0 || usedPercent > 100)) usedPercent = undefined;
+  if (usedPercent === undefined && percentWasOmitted) {
+    const used = centsValue(config.used);
+    const limit = centsValue(config.monthlyLimit);
+    if (used !== undefined && limit !== undefined && limit > 0) {
+      usedPercent = Math.min(100, (used / limit) * 100);
+    } else if (period && resetsAt !== undefined) {
+      // Proto3 omits zero-valued scalars at the beginning of a fresh period.
+      usedPercent = 0;
+    }
+  }
+
+  return usedPercent !== undefined || resetsAt !== undefined
+    ? [{ label, usedPercent, resetsAt }]
+    : null;
+}
+
+export function parseGrokUserId(payload: unknown): string | undefined {
+  if (!isRecord(payload)) return undefined;
+  const userId = payload.userId;
+  return typeof userId === "string" && userId.length > 0 && userId.length <= 256 && /^[\x21-\x7e]+$/.test(userId)
+    ? userId
+    : undefined;
+}
+
 function compactCountdown(resetsAt: number | undefined, nowMs: number): string {
   if (resetsAt === undefined || !Number.isFinite(resetsAt)) return "";
   const remaining = Math.max(0, resetsAt - nowMs);
@@ -194,14 +241,15 @@ export function formatProviderLine(
   nowMs = Date.now(),
 ): string {
   if (state.kind === "loading") return `${name}: loading…`;
-  if (state.kind === "login") return `${name}: /login for OAuth`;
+  if (state.kind === "login") return `${name}: ${state.command ?? "/login for OAuth"}`;
   if (state.kind === "error") return `${name}: ${state.message}`;
   return `${name}: ${state.windows.map((window) => formatUsageWindow(window, nowMs)).join(" · ")}`;
 }
 
 export function formatWidget(state: UsageState, nowMs = Date.now()): string[] {
   return [
-    `${formatProviderLine("Claude", state.anthropic, nowMs)} │ ${formatProviderLine("Codex", state.codex, nowMs)}`,
+    formatProviderLine("Claude", state.anthropic, nowMs),
+    `${formatProviderLine("Codex", state.codex, nowMs)} │ ${formatProviderLine("Grok", state.grok, nowMs)}`,
   ];
 }
 
@@ -236,6 +284,34 @@ function codexUsageUrl(baseUrl: string): string {
   return `${baseUrl.replace(/\/+$/, "")}/wham/usage`;
 }
 
+async function readBoundedJson(response: Response): Promise<unknown> {
+  const declaredLength = finiteNumber(response.headers.get("content-length"));
+  if (declaredLength !== undefined && declaredLength > MAX_RESPONSE_BYTES) throw new Error("oversized");
+  if (!response.body) return JSON.parse(await response.text());
+
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > MAX_RESPONSE_BYTES) throw new Error("oversized");
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+}
+
 async function requestJson(url: string, headers: Record<string, string>, signal: AbortSignal): Promise<
   | { kind: "ok"; payload: unknown }
   | { kind: "error"; message: string }
@@ -244,11 +320,12 @@ async function requestJson(url: string, headers: Record<string, string>, signal:
     const response = await fetch(url, {
       method: "GET",
       headers,
+      redirect: "error",
       signal: AbortSignal.any([signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)]),
     });
     if (!response.ok) return { kind: "error", message: `HTTP ${response.status}` };
     try {
-      return { kind: "ok", payload: await response.json() };
+      return { kind: "ok", payload: await readBoundedJson(response) };
     } catch {
       return { kind: "error", message: "malformed response" };
     }
@@ -302,12 +379,74 @@ async function loadCodex(ctx: ExtensionContext, signal: AbortSignal): Promise<Pr
   return windows ? { kind: "ready", windows } : { kind: "error", message: "malformed response" };
 }
 
+async function resolveGrokAuth(ctx: ExtensionContext): Promise<ProviderAuthResult | undefined> {
+  const active = ctx.model?.provider;
+  const providers = active === "xai-auth" || active === "xai" ? [active] : ["xai-auth", "xai"];
+  for (const provider of providers) {
+    try {
+      const resolved = await ctx.modelRegistry.getProviderAuth(provider);
+      if (isOAuth(resolved, false)) return resolved;
+    } catch {
+      // A broken sibling provider must not hide another valid Grok login.
+    }
+  }
+  return undefined;
+}
+
+function grokHeaders(
+  token: string,
+  clientMode: "interactive" | "headless",
+  userId?: string,
+): Record<string, string> {
+  return {
+    Authorization: `Bearer ${token}`,
+    Accept: "application/json",
+    "X-XAI-Token-Auth": "xai-grok-cli",
+    "x-grok-client-version": GROK_CLIENT_VERSION,
+    "x-grok-client-mode": clientMode,
+    ...(userId ? { "x-userid": userId } : {}),
+  };
+}
+
+async function loadGrok(ctx: ExtensionContext, signal: AbortSignal): Promise<ProviderState> {
+  let resolved: ProviderAuthResult | undefined;
+  try {
+    resolved = await resolveGrokAuth(ctx);
+  } catch {
+    return { kind: "error", message: "auth unavailable" };
+  }
+  if (!resolved?.auth.apiKey) return { kind: "login", command: "/login xai-auth" };
+
+  const clientMode = ctx.mode === "tui" ? "interactive" : "headless";
+  const identity = await requestJson(
+    `${GROK_BASE_URL}/user`,
+    grokHeaders(resolved.auth.apiKey, clientMode),
+    signal,
+  );
+  if (identity.kind === "error") return identity;
+  const userId = parseGrokUserId(identity.payload);
+  if (!userId) return { kind: "error", message: "identity unavailable" };
+
+  const billing = await requestJson(
+    `${GROK_BASE_URL}/billing?format=credits`,
+    grokHeaders(resolved.auth.apiKey, clientMode, userId),
+    signal,
+  );
+  if (billing.kind === "error") return billing;
+  const windows = parseGrokUsage(billing.payload);
+  return windows ? { kind: "ready", windows } : { kind: "error", message: "usage unavailable" };
+}
+
 export default function usageExtension(pi: ExtensionAPI): void {
   let alive = false;
   let generation = 0;
   let lastRefreshAt = 0;
   let activeController: AbortController | undefined;
-  let state: UsageState = { anthropic: { kind: "loading" }, codex: { kind: "loading" } };
+  let state: UsageState = {
+    anthropic: { kind: "loading" },
+    codex: { kind: "loading" },
+    grok: { kind: "loading" },
+  };
 
   const render = (ctx: ExtensionContext): void => {
     if (alive && ctx.hasUI !== false) {
@@ -323,7 +462,11 @@ export default function usageExtension(pi: ExtensionAPI): void {
     const controller = new AbortController();
     activeController = controller;
     const refreshGeneration = ++generation;
-    state = { anthropic: { kind: "loading" }, codex: { kind: "loading" } };
+    state = {
+      anthropic: { kind: "loading" },
+      codex: { kind: "loading" },
+      grok: { kind: "loading" },
+    };
     render(ctx);
 
     const update = (provider: keyof UsageState, next: ProviderState): void => {
@@ -335,6 +478,7 @@ export default function usageExtension(pi: ExtensionAPI): void {
     await Promise.all([
       loadAnthropic(ctx, controller.signal).then((next) => update("anthropic", next)),
       loadCodex(ctx, controller.signal).then((next) => update("codex", next)),
+      loadGrok(ctx, controller.signal).then((next) => update("grok", next)),
     ]);
     if (activeController === controller) activeController = undefined;
   };
