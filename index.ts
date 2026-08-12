@@ -221,9 +221,11 @@ function compactCountdown(resetsAt: number | undefined, nowMs: number): string {
   if (remaining < 60_000) return " <1m";
   const minutes = Math.ceil(remaining / 60_000);
   if (minutes < 60) return ` ${minutes}m`;
+  if (minutes < 24 * 60) {
+    return ` ${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+  }
   const hours = Math.ceil(remaining / 3_600_000);
-  if (hours < 48) return ` ${hours}h`;
-  return ` ${Math.ceil(remaining / 86_400_000)}d`;
+  return ` ${Math.floor(hours / 24)}d ${hours % 24}h`;
 }
 
 export function formatUsageWindow(window: UsageWindow, nowMs = Date.now()): string {

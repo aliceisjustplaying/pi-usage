@@ -3,8 +3,8 @@
 A small, zero-configuration [Pi](https://pi.dev) extension that shows Claude, OpenAI Codex/ChatGPT, and Grok subscription quota usage below the editor. Inspired by [`@marckrenn/pi-sub-bar`](https://github.com/marckrenn/pi-sub), but intentionally limited to these providers and current usage formats.
 
 ```text
-Claude: 5h ██░░░ 38% 2h · Week ███░░ 55% 4d · Fable █░░░░ 12% 3d
-Codex: 5h █░░░░ 20% 3h · Week ████░ 82% 2d │ Grok: Week ██░░░ 42% 4d
+Claude: 5h ██░░░ 38% 2h 17m · Week ███░░ 55% 4d 6h · Fable █░░░░ 12% 3d 2h
+Codex: 5h █░░░░ 20% 3h 8m · Week ████░ 82% 2d 4h │ Grok: Week ██░░░ 42% 4d 9h
 ```
 
 ## Install
@@ -22,7 +22,7 @@ Then sign in to the subscription providers you use with Pi's `/login` command. F
 - Only contacts subscription endpoints for OAuth credentials. API-key and logged-out users see a short `/login` hint.
 - Keeps no cache, starts no timers, and has no runtime dependencies.
 - Uses an 8-second request timeout and makes one request each for Claude and Codex, plus Grok's identity-first two-request billing flow. HTTP 429 responses are not retried.
-- Displays Claude on the first line and Codex plus Grok on the second. The short duration after each percentage is the time until that quota resets. Claude model-scoped weekly quotas are included; feature-specific Codex meters such as Spark are intentionally ignored.
+- Displays Claude on the first line and Codex plus Grok on the second. The short duration after each percentage is the time until that quota resets, shown as hours/minutes or days/hours. Claude model-scoped weekly quotas are included; feature-specific Codex meters such as Spark are intentionally ignored.
 - Uses only Pi-managed Grok OAuth from `xai-auth` or Pi's built-in `xai` provider. It never reads `~/.grok/auth.json` directly.
 
 The widget never reads Pi's auth files directly, logs tokens, persists credentials, or retains raw provider responses.

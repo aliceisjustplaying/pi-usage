@@ -216,11 +216,15 @@ test("formats compact bars, percentages, countdowns, and partial provider states
   const now = 1_700_000_000_000;
   assert.equal(
     formatUsageWindow({ label: "5h", usedPercent: 61, resetsAt: now + 61 * 60_000 }, now),
-    "5h ███░░ 61% 2h",
+    "5h ███░░ 61% 1h 1m",
   );
   assert.equal(
     formatUsageWindow({ label: "Week", resetsAt: now + 30_000 }, now),
     "Week ????? ?% <1m",
+  );
+  assert.equal(
+    formatUsageWindow({ label: "Week", usedPercent: 42, resetsAt: now + (5 * 24 + 3) * 3_600_000 }, now),
+    "Week ██░░░ 42% 5d 3h",
   );
   assert.equal(formatProviderLine("Claude", { kind: "login" }, now), "Claude: /login for OAuth");
   assert.deepEqual(
