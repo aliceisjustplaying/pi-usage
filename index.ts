@@ -158,35 +158,13 @@ function parseCodexWindow(value: unknown, fallbackLabel: string, nowMs: number):
   };
 }
 
-function appendCodexRateLimit(
-  output: UsageWindow[],
-  rateLimit: unknown,
-  prefix: string | undefined,
-  nowMs: number,
-): void {
-  if (!isRecord(rateLimit)) return;
-  const primary = parseCodexWindow(rateLimit.primary_window, "Primary", nowMs);
-  const secondary = parseCodexWindow(rateLimit.secondary_window, "Secondary", nowMs);
-  for (const window of [primary, secondary]) {
-    if (!window) continue;
-    output.push({ ...window, label: prefix ? `${prefix} ${window.label}` : window.label });
-  }
-}
-
-/** Parse shared and independently metered Codex usage windows. */
+/** Parse only the shared Codex usage windows, ignoring feature-specific meters. */
 export function parseCodexUsage(payload: unknown, nowMs = Date.now()): UsageWindow[] | null {
-  if (!isRecord(payload)) return null;
-  const windows: UsageWindow[] = [];
-  appendCodexRateLimit(windows, payload.rate_limit, undefined, nowMs);
-
-  if (Array.isArray(payload.additional_rate_limits)) {
-    for (const additional of payload.additional_rate_limits) {
-      if (!isRecord(additional)) continue;
-      const name =
-        cleanLabel(additional.limit_name) || cleanLabel(additional.metered_feature) || "Additional";
-      appendCodexRateLimit(windows, additional.rate_limit, name, nowMs);
-    }
-  }
+  if (!isRecord(payload) || !isRecord(payload.rate_limit)) return null;
+  const windows = [
+    parseCodexWindow(payload.rate_limit.primary_window, "Primary", nowMs),
+    parseCodexWindow(payload.rate_limit.secondary_window, "Secondary", nowMs),
+  ].filter((window): window is UsageWindow => window !== undefined);
   return windows.length > 0 ? windows : null;
 }
 

@@ -67,7 +67,7 @@ test("prefers generic account windows while retaining a missing legacy window", 
   );
 });
 
-test("parses Codex shared and every additional rate limit independently", () => {
+test("parses only Codex shared limits and ignores additional meters", () => {
   const now = 1_700_000_000_000;
   assert.deepEqual(
     parseCodexUsage(
@@ -95,12 +95,6 @@ test("parses Codex shared and every additional rate limit independently", () => 
               },
             },
           },
-          {
-            metered_feature: "Review",
-            rate_limit: {
-              secondary_window: { used_percent: 40, reset_after_seconds: 120 },
-            },
-          },
         ],
       },
       now,
@@ -108,8 +102,6 @@ test("parses Codex shared and every additional rate limit independently", () => 
     [
       { label: "5h", usedPercent: 31, resetsAt: 1_700_000_100_000 },
       { label: "Week", usedPercent: 62, resetsAt: 1_700_200_000_000 },
-      { label: "Spark 3h", usedPercent: 8, resetsAt: now + 90_000 },
-      { label: "Review Secondary", usedPercent: 40, resetsAt: now + 120_000 },
     ],
   );
 });
@@ -125,11 +117,13 @@ test("handles malformed and partial payloads", () => {
   assert.deepEqual(parseCodexUsage({ rate_limit: { primary_window: { used_percent: 0 } } }), [
     { label: "Primary", usedPercent: 0, resetsAt: undefined },
   ]);
-  assert.deepEqual(
+  assert.equal(
     parseCodexUsage({
-      additional_rate_limits: [null, { limit_name: "Broken" }, { limit_name: "Valid", rate_limit: { primary_window: { used_percent: 3 } } }],
+      additional_rate_limits: [
+        { limit_name: "Spark", rate_limit: { primary_window: { used_percent: 3 } } },
+      ],
     }),
-    [{ label: "Valid Primary", usedPercent: 3, resetsAt: undefined }],
+    null,
   );
 });
 
@@ -145,14 +139,6 @@ test("sanitizes provider-controlled labels before rendering", () => {
       ],
     }),
     [{ label: "Fable quota", usedPercent: 2, resetsAt: undefined }],
-  );
-  assert.deepEqual(
-    parseCodexUsage({
-      additional_rate_limits: [
-        { limit_name: "\u001b[2J Spark\n", rate_limit: { primary_window: { used_percent: 3 } } },
-      ],
-    }),
-    [{ label: "Spark Primary", usedPercent: 3, resetsAt: undefined }],
   );
 });
 

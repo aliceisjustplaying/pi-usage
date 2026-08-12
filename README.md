@@ -4,7 +4,7 @@ A small, zero-configuration [Pi](https://pi.dev) extension that shows Claude and
 
 ```text
 Claude: 5h ██░░░ 38% 2h · Week ███░░ 55% 4d · Fable █░░░░ 12% 3d
-Codex: 5h █░░░░ 20% 3h · Week ████░ 82% 2d · Spark 3h ░░░░░ 4% 1h
+Codex: 5h █░░░░ 20% 3h · Week ████░ 82% 2d
 ```
 
 ## Install
@@ -22,7 +22,7 @@ Then sign in to the subscription providers you use with Pi's `/login` command. T
 - Only contacts subscription endpoints for OAuth credentials. API-key and logged-out users see a short `/login` hint.
 - Keeps no cache, starts no timers, and has no runtime dependencies.
 - Uses an 8-second request timeout and makes one request per provider per refresh. In particular, HTTP 429 responses are not retried.
-- Displays independent Claude model-scoped weekly quotas and Codex additional meters when providers return them.
+- Displays independent Claude model-scoped weekly quotas and Codex's shared 5-hour and weekly limits. Feature-specific Codex meters such as Spark are intentionally ignored.
 
 The widget never reads Pi's auth files directly, logs tokens, persists credentials, or retains raw provider responses.
 
