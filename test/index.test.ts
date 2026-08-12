@@ -216,11 +216,11 @@ test("formats compact bars, percentages, countdowns, and partial provider states
   const now = 1_700_000_000_000;
   assert.equal(
     formatUsageWindow({ label: "5h", usedPercent: 61, resetsAt: now + 61 * 60_000 }, now),
-    "5h ███░░ 61% · reset in 2h",
+    "5h ███░░ 61% 2h",
   );
   assert.equal(
     formatUsageWindow({ label: "Week", resetsAt: now + 30_000 }, now),
-    "Week ????? ?% · reset in <1m",
+    "Week ????? ?% <1m",
   );
   assert.equal(formatProviderLine("Claude", { kind: "login" }, now), "Claude: /login for OAuth");
   assert.deepEqual(
