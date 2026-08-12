@@ -3,8 +3,8 @@
 A small, zero-configuration [Pi](https://pi.dev) extension that shows Claude, OpenAI Codex/ChatGPT, and Grok subscription quota usage below the editor. Inspired by [`@marckrenn/pi-sub-bar`](https://github.com/marckrenn/pi-sub), but intentionally limited to these providers and current usage formats.
 
 ```text
-Claude: 5h ██░░░ 38% 2h · Week ███░░ 55% 4d · Fable █░░░░ 12% 3d
-Codex: 5h █░░░░ 20% 3h · Week ████░ 82% 2d │ Grok: Week ██░░░ 42% 4d
+Claude: 5h ██░░░ 38% · reset in 2h · Week ███░░ 55% · reset in 4d · Fable █░░░░ 12% · reset in 3d
+Codex: 5h █░░░░ 20% · reset in 3h · Week ████░ 82% · reset in 2d │ Grok: Week ██░░░ 42% · reset in 4d
 ```
 
 ## Install

@@ -218,12 +218,12 @@ export function parseGrokUserId(payload: unknown): string | undefined {
 function compactCountdown(resetsAt: number | undefined, nowMs: number): string {
   if (resetsAt === undefined || !Number.isFinite(resetsAt)) return "";
   const remaining = Math.max(0, resetsAt - nowMs);
-  if (remaining < 60_000) return " <1m";
+  if (remaining < 60_000) return " · reset in <1m";
   const minutes = Math.ceil(remaining / 60_000);
-  if (minutes < 60) return ` ${minutes}m`;
+  if (minutes < 60) return ` · reset in ${minutes}m`;
   const hours = Math.ceil(remaining / 3_600_000);
-  if (hours < 48) return ` ${hours}h`;
-  return ` ${Math.ceil(remaining / 86_400_000)}d`;
+  if (hours < 48) return ` · reset in ${hours}h`;
+  return ` · reset in ${Math.ceil(remaining / 86_400_000)}d`;
 }
 
 export function formatUsageWindow(window: UsageWindow, nowMs = Date.now()): string {
