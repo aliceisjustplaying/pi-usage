@@ -1,0 +1,38 @@
+{
+  "name": "@aliceisjustplaying/pi-usage",
+  "version": "0.1.0",
+  "description": "Zero-configuration Claude and Codex subscription usage widget for Pi",
+  "private": true,
+  "license": "MIT",
+  "repository": "github:aliceisjustplaying/pi-usage",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "usage",
+    "claude",
+    "codex"
+  ],
+  "files": [
+    "index.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.6.0"
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types --test test/*.test.ts",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.84.1",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.3"
+  }
+}
