@@ -201,8 +201,7 @@ export function formatProviderLine(
 
 export function formatWidget(state: UsageState, nowMs = Date.now()): string[] {
   return [
-    formatProviderLine("Claude", state.anthropic, nowMs),
-    formatProviderLine("Codex", state.codex, nowMs),
+    `${formatProviderLine("Claude", state.anthropic, nowMs)} │ ${formatProviderLine("Codex", state.codex, nowMs)}`,
   ];
 }
 

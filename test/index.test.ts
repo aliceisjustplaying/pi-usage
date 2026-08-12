@@ -168,6 +168,6 @@ test("formats compact bars, percentages, countdowns, and partial provider states
       },
       now,
     ),
-    ["Claude: Fable █████ 100%", "Codex: HTTP 429"],
+    ["Claude: Fable █████ 100% │ Codex: HTTP 429"],
   );
 });
