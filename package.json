@@ -1,6 +1,6 @@
 {
   "name": "@aliceisjustplaying/pi-usage",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "Zero-configuration Claude and Codex subscription usage widget for Pi",
   "private": true,
   "license": "MIT",

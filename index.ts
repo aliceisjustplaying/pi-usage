@@ -222,10 +222,10 @@ function compactCountdown(resetsAt: number | undefined, nowMs: number): string {
   const minutes = Math.ceil(remaining / 60_000);
   if (minutes < 60) return ` ${minutes}m`;
   if (minutes < 24 * 60) {
-    return ` ${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+    return ` ${Math.floor(minutes / 60)}h${minutes % 60}m`;
   }
   const hours = Math.ceil(remaining / 3_600_000);
-  return ` ${Math.floor(hours / 24)}d ${hours % 24}h`;
+  return ` ${Math.floor(hours / 24)}d${hours % 24}h`;
 }
 
 export function formatUsageWindow(window: UsageWindow, nowMs = Date.now()): string {
