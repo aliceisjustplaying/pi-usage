@@ -1,11 +1,19 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Container, Text } from "@earendil-works/pi-tui";
+import { execFile } from "node:child_process";
+import { createDecipheriv, pbkdf2Sync } from "node:crypto";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 const WIDGET_ID = "pi-usage";
 const REFRESH_INTERVAL_MS = 60_000;
 const ANTHROPIC_REFRESH_INTERVAL_MS = 5 * 60_000;
 const REQUEST_TIMEOUT_MS = 8_000;
 const CODEX_FALLBACK_BASE_URL = "https://chatgpt.com/backend-api";
+const CLAUDE_WEB_BASE_URL = "https://claude.ai";
+const CLAUDE_DESKTOP_COOKIE_DB = join(homedir(), "Library/Application Support/Claude/Cookies");
+const MACOS_KEYCHAIN_COMMAND = "/usr/bin/security";
+const MACOS_SQLITE_COMMAND = "/usr/bin/sqlite3";
 const GROK_BASE_URL = "https://cli-chat-proxy.grok.com/v1";
 const GROK_CLIENT_VERSION = "1.0.3";
 const MAX_RESPONSE_BYTES = 64 * 1024;
@@ -341,7 +349,99 @@ async function requestJson(url: string, headers: Record<string, string>, signal:
   }
 }
 
-async function loadAnthropic(ctx: ExtensionContext, signal: AbortSignal): Promise<ProviderState> {
+function execFileText(command: string, args: string[], signal: AbortSignal): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile(command, args, {
+      encoding: "utf8",
+      maxBuffer: MAX_RESPONSE_BYTES,
+      signal,
+      timeout: REQUEST_TIMEOUT_MS,
+    }, (error, stdout) => {
+      if (error) reject(error);
+      else resolve(stdout);
+    });
+  });
+}
+
+function decryptClaudeDesktopCookie(hex: string, key: Buffer): string | undefined {
+  if (!/^(?:[0-9a-f]{2})+$/i.test(hex)) return undefined;
+  const encrypted = Buffer.from(hex, "hex");
+  if (encrypted.subarray(0, 3).toString() !== "v10") return undefined;
+  try {
+    const decipher = createDecipheriv("aes-128-cbc", key, Buffer.alloc(16, 0x20));
+    const decrypted = Buffer.concat([
+      decipher.update(encrypted.subarray(3)),
+      decipher.final(),
+    ]).subarray(32).toString("utf8");
+    return decrypted.length > 0 &&
+      decrypted.length <= 8_192 &&
+      /^[\x21\x23-\x2b\x2d-\x3a\x3c-\x5b\x5d-\x7e]+$/.test(decrypted)
+      ? decrypted
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function readClaudeDesktopCookies(signal: AbortSignal): Promise<{
+  sessionKey: string;
+  organizationId: string;
+  clearance?: string;
+} | null> {
+  if (process.platform !== "darwin") return null;
+  try {
+    const [password, rows] = await Promise.all([
+      execFileText(MACOS_KEYCHAIN_COMMAND, [
+        "find-generic-password",
+        "-s",
+        "Claude Safe Storage",
+        "-w",
+      ], signal),
+      execFileText(MACOS_SQLITE_COMMAND, [
+        "-separator",
+        "\t",
+        CLAUDE_DESKTOP_COOKIE_DB,
+        "SELECT name, hex(encrypted_value) FROM cookies WHERE host_key = '.claude.ai' AND name IN ('sessionKey', 'lastActiveOrg', 'cf_clearance');",
+      ], signal),
+    ]);
+    const key = pbkdf2Sync(password.trim(), "saltysalt", 1003, 16, "sha1");
+    const encrypted = new Map<string, string>();
+    for (const line of rows.trim().split("\n")) {
+      const separator = line.indexOf("\t");
+      if (separator > 0) encrypted.set(line.slice(0, separator), line.slice(separator + 1));
+    }
+    const sessionKey = decryptClaudeDesktopCookie(encrypted.get("sessionKey") ?? "", key);
+    const organizationId = decryptClaudeDesktopCookie(encrypted.get("lastActiveOrg") ?? "", key);
+    const clearance = decryptClaudeDesktopCookie(encrypted.get("cf_clearance") ?? "", key);
+    if (!sessionKey || !organizationId || organizationId.length > 256) return null;
+    return { sessionKey, organizationId, clearance };
+  } catch {
+    return null;
+  }
+}
+
+async function loadClaudeWebUsage(signal: AbortSignal): Promise<UsageWindow[] | null> {
+  const cookies = await readClaudeDesktopCookies(signal);
+  if (!cookies) return null;
+  let cookie = `sessionKey=${cookies.sessionKey}; lastActiveOrg=${cookies.organizationId}`;
+  if (cookies.clearance) cookie += `; cf_clearance=${cookies.clearance}`;
+  const result = await requestJson(
+    `${CLAUDE_WEB_BASE_URL}/api/organizations/${encodeURIComponent(cookies.organizationId)}/usage`,
+    {
+      Cookie: cookie,
+      Accept: "application/json",
+      "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+    },
+    signal,
+  );
+  return result.kind === "ok" ? parseAnthropicUsage(result.payload) : null;
+}
+
+async function loadAnthropic(
+  ctx: ExtensionContext,
+  signal: AbortSignal,
+  loadWebUsage: (signal: AbortSignal) => Promise<UsageWindow[] | null>,
+): Promise<ProviderState> {
   let resolved: ProviderAuthResult | undefined;
   try {
     resolved = await ctx.modelRegistry.getProviderAuth("anthropic");
@@ -355,7 +455,13 @@ async function loadAnthropic(ctx: ExtensionContext, signal: AbortSignal): Promis
     "anthropic-beta": "oauth-2025-04-20",
     Accept: "application/json",
   }, signal);
-  if (result.kind === "error") return result;
+  if (result.kind === "error") {
+    if (result.message === "HTTP 429") {
+      const fallbackWindows = await loadWebUsage(signal);
+      if (fallbackWindows) return { kind: "ready", windows: fallbackWindows };
+    }
+    return result;
+  }
   const windows = parseAnthropicUsage(result.payload);
   return windows ? { kind: "ready", windows } : { kind: "error", message: "malformed response" };
 }
@@ -441,7 +547,15 @@ async function loadGrok(ctx: ExtensionContext, signal: AbortSignal): Promise<Pro
   return windows ? { kind: "ready", windows } : { kind: "error", message: "usage unavailable" };
 }
 
-export default function usageExtension(pi: ExtensionAPI): void {
+export interface UsageExtensionDependencies {
+  loadClaudeWebUsage?: (signal: AbortSignal) => Promise<UsageWindow[] | null>;
+}
+
+export default function usageExtension(
+  pi: ExtensionAPI,
+  dependencies: UsageExtensionDependencies = {},
+): void {
+  const loadWebUsage = dependencies.loadClaudeWebUsage ?? loadClaudeWebUsage;
   let alive = false;
   let generation: Record<keyof UsageState, number> = {
     anthropic: 0,
@@ -542,7 +656,8 @@ export default function usageExtension(pi: ExtensionAPI): void {
       requests.push(request);
     };
 
-    schedule("anthropic", ANTHROPIC_REFRESH_INTERVAL_MS, loadAnthropic);
+    schedule("anthropic", ANTHROPIC_REFRESH_INTERVAL_MS, (ctx, signal) =>
+      loadAnthropic(ctx, signal, loadWebUsage));
     schedule("codex", REFRESH_INTERVAL_MS, loadCodex);
     schedule("grok", REFRESH_INTERVAL_MS, loadGrok);
     await Promise.all(requests);

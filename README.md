@@ -13,16 +13,17 @@ Codex: 5h █░░░░ 20% 3h8m · Week ████░ 82% 2d4h │ Grok: We
 pi install git:github.com/aliceisjustplaying/pi-usage
 ```
 
-Then sign in to the subscription providers you use with Pi's `/login` command. For Grok, install [`pi-xai-oauth`](https://github.com/BlockedPath/pi-xai-oauth) and run `/login xai-auth`; existing official Grok CLI credentials can be imported by that login flow. The widget always checks all three providers, regardless of the active model. Anthropic's `ANTHROPIC_OAUTH_TOKEN` environment variable is also recognized by Pi as an OAuth-token source.
+Then sign in to the subscription providers you use with Pi's `/login` command. For Grok, install [`pi-xai-oauth`](https://github.com/BlockedPath/pi-xai-oauth) and run `/login xai-auth`; existing official Grok CLI credentials can be imported by that login flow. The widget always checks all three providers, regardless of the active model. Anthropic's `ANTHROPIC_OAUTH_TOKEN` environment variable is also recognized by Pi as an OAuth-token source. On macOS, if Anthropic's OAuth usage endpoint returns HTTP 429, the extension can fall back to an existing logged-in Claude Desktop session.
 
 ## Behavior
 
 - Refreshes asynchronously when a session starts, when the agent starts or settles, and whenever `/usage` is run. During active agent runs, Codex and Grok refresh every 60 seconds; Claude refreshes at most every 5 minutes to avoid rate-limiting its usage endpoint.
 - Uses Pi's `ctx.modelRegistry.getProviderAuth` so token refresh stays owned by Pi.
-- Only contacts subscription endpoints for OAuth credentials. API-key and logged-out users see a short `/login` hint.
+- Normally contacts subscription endpoints only for OAuth credentials. API-key and logged-out users see a short `/login` hint.
+- On an Anthropic OAuth HTTP 429, the macOS fallback reads Claude Desktop's encrypted `sessionKey`, organization, and optional Cloudflare cookies, decrypts them with the `Claude Safe Storage` Keychain entry, and sends them only to `https://claude.ai/api/organizations/{orgId}/usage`. The cookies are never logged or persisted by this extension. macOS may show a Keychain permission prompt the first time. Claude Desktop and Pi can be signed into different Anthropic accounts; the widget keeps the compact `Claude:` label either way.
 - Mounts one persistent TUI widget and updates its existing text components only when a displayed line changes. Its single polling timer exists only while the agent is active and is cleaned up when the agent settles or the session shuts down.
 - Keeps no persistent cache. If Claude's usage endpoint returns HTTP 429 after a successful refresh, the widget retains the last known Claude windows instead of replacing them with the transport error.
-- Uses an 8-second request timeout and makes one request each for Claude and Codex, plus Grok's identity-first two-request billing flow. HTTP 429 responses are not retried.
+- Uses an 8-second timeout per request or local credential command. The normal path makes one request each for Claude and Codex, plus Grok's identity-first two-request billing flow. After an Anthropic OAuth 429, Keychain access, SQLite access, and the web fallback can extend that Claude refresh to roughly 24 seconds in the worst case. HTTP 429 responses are not retried.
 - Displays Claude on the first line and Codex plus Grok on the second. The short duration after each percentage is the time until that quota resets, shown as hours/minutes or days/hours. Claude model-scoped weekly quotas are included; feature-specific Codex meters such as Spark are intentionally ignored.
 - Uses only Pi-managed Grok OAuth from `xai-auth` or Pi's built-in `xai` provider. It never reads `~/.grok/auth.json` directly.
 
@@ -43,7 +44,7 @@ Tests use Node's built-in test runner and require Node 22.19 or newer. The exten
 
 The subscription usage APIs are private and undocumented:
 
-- Anthropic: `GET https://api.anthropic.com/api/oauth/usage`
+- Anthropic: `GET https://api.anthropic.com/api/oauth/usage`; on macOS HTTP 429 only, `GET https://claude.ai/api/organizations/{orgId}/usage` using the local Claude Desktop web session
 - OpenAI Codex: `GET <provider baseUrl>/wham/usage` (normally `https://chatgpt.com/backend-api/wham/usage`)
 - Grok: `GET https://cli-chat-proxy.grok.com/v1/user`, then `GET /v1/billing?format=credits` with the transient validated user ID
 

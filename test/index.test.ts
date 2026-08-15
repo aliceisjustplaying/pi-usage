@@ -240,6 +240,84 @@ test("formats compact bars, percentages, countdowns, and partial provider states
   );
 });
 
+test("falls back to Claude Desktop web usage when the OAuth endpoint is rate limited", async () => {
+  type Handler = (event: unknown, ctx: unknown) => unknown;
+  type WidgetContent = string[] | ((tui: unknown, theme: unknown) => { render(width: number): string[] });
+  type UsageExtensionWithFallback = (
+    pi: unknown,
+    dependencies: { loadClaudeWebUsage(signal: AbortSignal): Promise<Array<{ label: string; usedPercent: number }> | null> },
+  ) => void;
+
+  const handlers = new Map<string, Handler>();
+  let fallbackRequests = 0;
+  let mountedWidget: { render(width: number): string[] } | undefined;
+  const originalFetch = globalThis.fetch;
+
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    const url = String(input);
+    assert.match(url, /api\.anthropic\.com/);
+    return Response.json(
+      { error: { type: "rate_limit_error", message: "Rate limited. Please try again later." } },
+      { status: 429 },
+    );
+  }) as typeof fetch;
+
+  (usageExtension as unknown as UsageExtensionWithFallback)(
+    {
+      on(event: string, handler: Handler) {
+        handlers.set(event, handler);
+      },
+      registerCommand() {},
+    },
+    {
+      async loadClaudeWebUsage() {
+        fallbackRequests += 1;
+        return [
+          { label: "5h", usedPercent: 6 },
+          { label: "Week", usedPercent: 51 },
+          { label: "Fable", usedPercent: 100 },
+        ];
+      },
+    },
+  );
+
+  const ctx = {
+    hasUI: true,
+    mode: "tui",
+    ui: {
+      setWidget(_key: string, content: WidgetContent | undefined) {
+        if (typeof content === "function") {
+          mountedWidget = content({ requestRender() {} }, {});
+        }
+      },
+    },
+    modelRegistry: {
+      async getProviderAuth(provider: string) {
+        return provider === "anthropic"
+          ? { auth: { apiKey: "oauth-token" }, source: "OAuth" }
+          : undefined;
+      },
+      getProvider() {
+        return undefined;
+      },
+    },
+  };
+  const claudeLine = (): string => mountedWidget?.render(200)[0]?.trim() ?? "";
+
+  try {
+    handlers.get("session_start")?.({}, ctx);
+    for (let attempt = 0; attempt < 50 && claudeLine().includes("loading"); attempt += 1) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+
+    assert.equal(fallbackRequests, 1);
+    assert.equal(claudeLine(), "Claude: 5h ░░░░░ 6% · Week ███░░ 51% · Fable █████ 100%");
+  } finally {
+    globalThis.fetch = originalFetch;
+    handlers.get("session_shutdown")?.({}, ctx);
+  }
+});
+
 test("updates a mounted widget in place and retains Claude usage when polling is rate limited", async () => {
   type Handler = (event: unknown, ctx: unknown) => unknown;
   type WidgetContent = string[] | ((tui: unknown, theme: unknown) => { render(width: number): string[] });
@@ -253,7 +331,7 @@ test("updates a mounted widget in place and retains Claude usage when polling is
     registerCommand(name: string, command: { handler: (args: string, ctx: unknown) => Promise<void> }) {
       if (name === "usage") usageCommand = command.handler;
     },
-  } as never);
+  } as never, { loadClaudeWebUsage: async () => null });
 
   const originalFetch = globalThis.fetch;
   const originalDateNow = Date.now;
