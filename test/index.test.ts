@@ -240,6 +240,229 @@ test("formats compact bars, percentages, countdowns, and partial provider states
   );
 });
 
+test("updates a mounted widget in place and retains Claude usage when polling is rate limited", async () => {
+  type Handler = (event: unknown, ctx: unknown) => unknown;
+  type WidgetContent = string[] | ((tui: unknown, theme: unknown) => { render(width: number): string[] });
+
+  const handlers = new Map<string, Handler>();
+  let usageCommand: ((args: string, ctx: unknown) => Promise<void>) | undefined;
+  usageExtension({
+    on(event: string, handler: Handler) {
+      handlers.set(event, handler);
+    },
+    registerCommand(name: string, command: { handler: (args: string, ctx: unknown) => Promise<void> }) {
+      if (name === "usage") usageCommand = command.handler;
+    },
+  } as never);
+
+  const originalFetch = globalThis.fetch;
+  const originalDateNow = Date.now;
+  let nowMs = 1_700_000_000_000;
+  Date.now = () => nowMs;
+  let anthropicRequests = 0;
+  let codexRequests = 0;
+  let renderRequests = 0;
+  const widgetUpdates: WidgetContent[] = [];
+  let mountedWidget: { render(width: number): string[] } | undefined;
+
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    const url = String(input);
+    if (url.includes("api.anthropic.com")) {
+      anthropicRequests += 1;
+      if (anthropicRequests === 2) {
+        return Response.json(
+          { error: { type: "rate_limit_error", message: "Rate limited. Please try again later." } },
+          { status: 429 },
+        );
+      }
+      return Response.json({
+        limits: [
+          { kind: "session", percent: 100 },
+          {
+            kind: "weekly_scoped",
+            percent: 100,
+            scope: { model: { display_name: "Fable" } },
+          },
+        ],
+      });
+    }
+    if (url.includes("/wham/usage")) {
+      codexRequests += 1;
+      return Response.json({
+        rate_limit: { primary_window: { used_percent: codexRequests === 1 ? 31 : 32 } },
+      });
+    }
+    if (url.endsWith("/user")) return Response.json({ userId: "user-123" });
+    if (url.includes("/billing")) {
+      return Response.json({ config: { creditUsagePercent: 42 } });
+    }
+    throw new Error(`unexpected request: ${url}`);
+  }) as typeof fetch;
+
+  const ctx = {
+    hasUI: true,
+    mode: "tui",
+    ui: {
+      setWidget(_key: string, content: WidgetContent | undefined) {
+        if (content === undefined) return;
+        widgetUpdates.push(content);
+        if (typeof content === "function") {
+          mountedWidget = content({ requestRender: () => { renderRequests += 1; } }, {});
+        }
+      },
+    },
+    modelRegistry: {
+      async getProviderAuth(provider: string) {
+        return {
+          auth: { apiKey: "header.payload.signature" },
+          source: "OAuth",
+          ...(provider === "openai-codex" ? { auth: { apiKey: "header.payload.signature" } } : {}),
+        };
+      },
+      getProvider() {
+        return undefined;
+      },
+    },
+  };
+  const visibleLines = (): string[] => {
+    if (mountedWidget) return mountedWidget.render(200).map((line) => line.trim());
+    const latest = widgetUpdates.at(-1);
+    return Array.isArray(latest) ? latest : [];
+  };
+  const waitFor = async (predicate: () => boolean): Promise<void> => {
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      if (predicate()) return;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    assert.fail("usage refresh did not settle");
+  };
+
+  try {
+    const start = handlers.get("session_start");
+    assert.ok(start);
+    start({}, ctx);
+    await waitFor(() => visibleLines()[0]?.includes("Fable") === true);
+
+    const claudeBefore = visibleLines()[0];
+    const rendersBefore = renderRequests;
+    nowMs += 60_000;
+    handlers.get("agent_settled")?.({}, ctx);
+    await waitFor(() => codexRequests === 2 && visibleLines()[1]?.includes("32%") === true);
+    const anthropicRequestsAfterMinute = anthropicRequests;
+
+    assert.ok(usageCommand);
+    await usageCommand("", ctx);
+
+    assert.deepEqual(
+      {
+        widgetRegistrations: widgetUpdates.length,
+        changedLineRenders: renderRequests - rendersBefore,
+        anthropicRequestsAfterMinute,
+        claudeBefore,
+        claudeAfter: visibleLines()[0],
+        codexAfter: visibleLines()[1],
+      },
+      {
+        widgetRegistrations: 1,
+        changedLineRenders: 1,
+        anthropicRequestsAfterMinute: 1,
+        claudeBefore: "Claude: 5h █████ 100% · Fable █████ 100%",
+        claudeAfter: "Claude: 5h █████ 100% · Fable █████ 100%",
+        codexAfter: "Codex: Primary ██░░░ 32% │ Grok: Week ██░░░ 42%",
+      },
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    Date.now = originalDateNow;
+    handlers.get("session_shutdown")?.({}, ctx);
+  }
+});
+
+test("a one-minute provider poll does not invalidate a slow Claude refresh", async () => {
+  type Handler = (event: unknown, ctx: unknown) => unknown;
+  type WidgetContent = string[] | ((tui: unknown, theme: unknown) => { render(width: number): string[] });
+  type ResolvedAuth = { auth: { apiKey: string }; source: string };
+
+  const handlers = new Map<string, Handler>();
+  usageExtension({
+    on(event: string, handler: Handler) {
+      handlers.set(event, handler);
+    },
+    registerCommand() {},
+  } as never);
+
+  const originalFetch = globalThis.fetch;
+  const originalDateNow = Date.now;
+  let nowMs = 1_700_000_000_000;
+  Date.now = () => nowMs;
+  let resolveAnthropicAuth!: (auth: ResolvedAuth) => void;
+  const delayedAnthropicAuth = new Promise<ResolvedAuth>((resolve) => {
+    resolveAnthropicAuth = resolve;
+  });
+  let anthropicAuthRequests = 0;
+  let codexAuthRequests = 0;
+  let mountedWidget: { render(width: number): string[] } | undefined;
+
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    const url = String(input);
+    assert.match(url, /api\.anthropic\.com/);
+    return Response.json({ limits: [{ kind: "session", percent: 64 }] });
+  }) as typeof fetch;
+
+  const ctx = {
+    hasUI: true,
+    mode: "tui",
+    ui: {
+      setWidget(_key: string, content: WidgetContent | undefined) {
+        if (typeof content === "function") {
+          mountedWidget = content({ requestRender() {} }, {});
+        }
+      },
+    },
+    modelRegistry: {
+      async getProviderAuth(provider: string) {
+        if (provider === "anthropic") {
+          anthropicAuthRequests += 1;
+          return delayedAnthropicAuth;
+        }
+        if (provider === "openai-codex") codexAuthRequests += 1;
+        return undefined;
+      },
+      getProvider() {
+        return undefined;
+      },
+    },
+  };
+  const visibleLines = (): string[] => mountedWidget?.render(200).map((line) => line.trim()) ?? [];
+  const waitFor = async (predicate: () => boolean): Promise<void> => {
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      if (predicate()) return;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    assert.fail("overlapping usage refresh did not settle");
+  };
+
+  try {
+    handlers.get("session_start")?.({}, ctx);
+    await waitFor(() => codexAuthRequests === 1 && visibleLines()[1]?.includes("/login") === true);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    nowMs += 60_000;
+    handlers.get("agent_settled")?.({}, ctx);
+    await waitFor(() => codexAuthRequests === 2);
+
+    resolveAnthropicAuth({ auth: { apiKey: "oauth-token" }, source: "OAuth" });
+    await waitFor(() => visibleLines()[0]?.includes("64%") === true);
+
+    assert.equal(anthropicAuthRequests, 1, "the slow Claude auth request should be coalesced");
+    assert.match(visibleLines()[0] ?? "", /^Claude: 5h ███░░ 64%$/);
+  } finally {
+    globalThis.fetch = originalFetch;
+    Date.now = originalDateNow;
+    handlers.get("session_shutdown")?.({}, ctx);
+  }
+});
+
 test("polls every minute only while the agent is active", () => {
   type Handler = (event: unknown, ctx: unknown) => unknown;
 

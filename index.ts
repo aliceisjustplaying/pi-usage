@@ -1,7 +1,9 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Container, Text } from "@earendil-works/pi-tui";
 
 const WIDGET_ID = "pi-usage";
 const REFRESH_INTERVAL_MS = 60_000;
+const ANTHROPIC_REFRESH_INTERVAL_MS = 5 * 60_000;
 const REQUEST_TIMEOUT_MS = 8_000;
 const CODEX_FALLBACK_BASE_URL = "https://chatgpt.com/backend-api";
 const GROK_BASE_URL = "https://cli-chat-proxy.grok.com/v1";
@@ -441,10 +443,22 @@ async function loadGrok(ctx: ExtensionContext, signal: AbortSignal): Promise<Pro
 
 export default function usageExtension(pi: ExtensionAPI): void {
   let alive = false;
-  let generation = 0;
-  let lastRefreshAt = 0;
+  let generation: Record<keyof UsageState, number> = {
+    anthropic: 0,
+    codex: 0,
+    grok: 0,
+  };
+  let lastRefreshAt: Record<keyof UsageState, number> = {
+    anthropic: 0,
+    codex: 0,
+    grok: 0,
+  };
   let refreshTimer: ReturnType<typeof setInterval> | undefined;
-  let activeController: AbortController | undefined;
+  let activeControllers: Partial<Record<keyof UsageState, AbortController>> = {};
+  let activeRefreshes: Partial<Record<keyof UsageState, Promise<void>>> = {};
+  let widgetLines: string[] = [];
+  let widgetText: Text[] | undefined;
+  let requestWidgetRender: (() => void) | undefined;
   let state: UsageState = {
     anthropic: { kind: "loading" },
     codex: { kind: "loading" },
@@ -452,38 +466,86 @@ export default function usageExtension(pi: ExtensionAPI): void {
   };
 
   const render = (ctx: ExtensionContext): void => {
-    if (alive && ctx.hasUI !== false) {
-      ctx.ui.setWidget(WIDGET_ID, formatWidget(state), { placement: "belowEditor" });
+    if (!alive || ctx.hasUI === false) return;
+    const nextLines = formatWidget(state);
+    const changedLines = nextLines.map((line, index) => line !== widgetLines[index]);
+    if (nextLines.length === widgetLines.length && changedLines.every((changed) => !changed)) return;
+    widgetLines = nextLines;
+
+    if (ctx.mode === "tui" && widgetText) {
+      for (const [index, line] of widgetLines.entries()) {
+        if (changedLines[index]) widgetText[index]?.setText(line);
+      }
+      requestWidgetRender?.();
+      return;
     }
+    ctx.ui.setWidget(WIDGET_ID, widgetLines, { placement: "belowEditor" });
+  };
+
+  const mountWidget = (ctx: ExtensionContext): void => {
+    if (ctx.hasUI === false) return;
+    widgetLines = formatWidget(state);
+    if (ctx.mode !== "tui") {
+      ctx.ui.setWidget(WIDGET_ID, widgetLines, { placement: "belowEditor" });
+      return;
+    }
+
+    ctx.ui.setWidget(WIDGET_ID, (tui) => {
+      const container = new Container();
+      widgetText = widgetLines.map((line) => new Text(line, 1, 0));
+      for (const line of widgetText) container.addChild(line);
+      requestWidgetRender = () => tui.requestRender();
+      return container;
+    }, { placement: "belowEditor" });
   };
 
   const refresh = async (ctx: ExtensionContext, force: boolean): Promise<void> => {
     const now = Date.now();
-    if (!alive || (!force && now - lastRefreshAt < REFRESH_INTERVAL_MS)) return;
-    lastRefreshAt = now;
-    activeController?.abort();
-    const controller = new AbortController();
-    activeController = controller;
-    const refreshGeneration = ++generation;
-    state = {
-      anthropic: { kind: "loading" },
-      codex: { kind: "loading" },
-      grok: { kind: "loading" },
-    };
-    render(ctx);
+    if (!alive) return;
+    const requests: Promise<void>[] = [];
 
-    const update = (provider: keyof UsageState, next: ProviderState): void => {
-      if (!alive || generation !== refreshGeneration) return;
-      state = { ...state, [provider]: next };
-      render(ctx);
+    const schedule = (
+      provider: keyof UsageState,
+      intervalMs: number,
+      load: (ctx: ExtensionContext, signal: AbortSignal) => Promise<ProviderState>,
+    ): void => {
+      if (!force && now - lastRefreshAt[provider] < intervalMs) return;
+      const currentRefresh = activeRefreshes[provider];
+      if (currentRefresh) {
+        requests.push(currentRefresh);
+        return;
+      }
+
+      lastRefreshAt[provider] = now;
+      const controller = new AbortController();
+      activeControllers[provider] = controller;
+      const refreshGeneration = ++generation[provider];
+      let request: Promise<void>;
+      request = load(ctx, controller.signal)
+        .then((next) => {
+          if (!alive || generation[provider] !== refreshGeneration) return;
+          const current = state[provider];
+          if (
+            provider === "anthropic" &&
+            current.kind === "ready" &&
+            next.kind === "error" &&
+            next.message === "HTTP 429"
+          ) return;
+          state = { ...state, [provider]: next };
+          render(ctx);
+        })
+        .finally(() => {
+          if (activeControllers[provider] === controller) delete activeControllers[provider];
+          if (activeRefreshes[provider] === request) delete activeRefreshes[provider];
+        });
+      activeRefreshes[provider] = request;
+      requests.push(request);
     };
 
-    await Promise.all([
-      loadAnthropic(ctx, controller.signal).then((next) => update("anthropic", next)),
-      loadCodex(ctx, controller.signal).then((next) => update("codex", next)),
-      loadGrok(ctx, controller.signal).then((next) => update("grok", next)),
-    ]);
-    if (activeController === controller) activeController = undefined;
+    schedule("anthropic", ANTHROPIC_REFRESH_INTERVAL_MS, loadAnthropic);
+    schedule("codex", REFRESH_INTERVAL_MS, loadCodex);
+    schedule("grok", REFRESH_INTERVAL_MS, loadGrok);
+    await Promise.all(requests);
   };
 
   const stopRefreshTimer = (): void => {
@@ -501,7 +563,13 @@ export default function usageExtension(pi: ExtensionAPI): void {
 
   pi.on("session_start", (_event, ctx) => {
     alive = true;
-    lastRefreshAt = 0;
+    lastRefreshAt = { anthropic: 0, codex: 0, grok: 0 };
+    state = {
+      anthropic: { kind: "loading" },
+      codex: { kind: "loading" },
+      grok: { kind: "loading" },
+    };
+    mountWidget(ctx);
     void refresh(ctx, true);
   });
 
@@ -518,9 +586,15 @@ export default function usageExtension(pi: ExtensionAPI): void {
   pi.on("session_shutdown", (_event, ctx) => {
     alive = false;
     stopRefreshTimer();
-    generation += 1;
-    activeController?.abort();
-    activeController = undefined;
+    for (const provider of ["anthropic", "codex", "grok"] as const) {
+      generation[provider] += 1;
+      activeControllers[provider]?.abort();
+    }
+    activeControllers = {};
+    activeRefreshes = {};
+    widgetText = undefined;
+    requestWidgetRender = undefined;
+    widgetLines = [];
     ctx.ui.setWidget(WIDGET_ID, undefined);
   });
 
