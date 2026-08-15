@@ -1,8 +1,8 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Container, Text } from "@earendil-works/pi-tui";
 import { execFile } from "node:child_process";
-import { createDecipheriv, pbkdf2Sync, randomBytes } from "node:crypto";
-import { mkdir, open, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { createDecipheriv, pbkdf2Sync } from "node:crypto";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { request as httpsRequest } from "node:https";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -14,14 +14,7 @@ const REQUEST_TIMEOUT_MS = 8_000;
 const CODEX_FALLBACK_BASE_URL = "https://chatgpt.com/backend-api";
 const CLAUDE_DESKTOP_COOKIE_DB = join(homedir(), "Library/Application Support/Claude/Cookies");
 const CLAUDE_WEB_CACHE = join(homedir(), ".cache/pi-usage/claude-web.json");
-const CLAUDE_WEB_CACHE_LOCK = `${CLAUDE_WEB_CACHE}.lock`;
-const CLAUDE_WEB_CACHE_FRESH_MS = 30_000;
-const CLAUDE_WEB_CACHE_MAX_BYTES = 64 * 1024;
-const CLAUDE_WEB_CACHE_MAX_WINDOWS = 32;
 const CLAUDE_WEB_CACHE_MAX_MS = 24 * 60 * 60_000;
-const CLAUDE_WEB_LOCK_MAX_MS = 30_000;
-const CLAUDE_WEB_LOCK_WAIT_MS = 20_000;
-const CLAUDE_WEB_LOCK_POLL_MS = 100;
 const MACOS_KEYCHAIN_COMMAND = "/usr/bin/security";
 const MACOS_SQLITE_COMMAND = "/usr/bin/sqlite3";
 const GROK_BASE_URL = "https://cli-chat-proxy.grok.com/v1";
@@ -498,20 +491,15 @@ async function requestClaudeWebUsage(
   });
 }
 
-export function parseClaudeWebCache(payload: unknown, nowMs = Date.now()): {
+function parseClaudeWebCache(payload: unknown, nowMs = Date.now()): {
   windows: UsageWindow[];
   ageMs: number;
 } | null {
-  if (!isRecord(payload)) return null;
+  if (!isRecord(payload) || !Array.isArray(payload.windows)) return null;
   const cachedAt = finiteNumber(payload.cachedAt);
   if (cachedAt === undefined) return null;
   const ageMs = nowMs - cachedAt;
-  if (
-    ageMs < 0 ||
-    ageMs > CLAUDE_WEB_CACHE_MAX_MS ||
-    !Array.isArray(payload.windows) ||
-    payload.windows.length > CLAUDE_WEB_CACHE_MAX_WINDOWS
-  ) return null;
+  if (ageMs < 0 || ageMs > CLAUDE_WEB_CACHE_MAX_MS) return null;
   const windows: UsageWindow[] = [];
   for (const entry of payload.windows) {
     if (!isRecord(entry)) continue;
@@ -520,26 +508,9 @@ export function parseClaudeWebCache(payload: unknown, nowMs = Date.now()): {
     const resetsAt = finiteNumber(entry.resetsAt);
     if (!label || (usedPercent === undefined && resetsAt === undefined)) continue;
     if (resetsAt !== undefined && resetsAt <= nowMs) continue;
-    if (resetsAt === undefined && ageMs > ANTHROPIC_REFRESH_INTERVAL_MS) continue;
     windows.push({ label, usedPercent, resetsAt });
   }
   return windows.length > 0 ? { windows, ageMs } : null;
-}
-
-async function readBoundedTextFile(path: string, maxBytes: number): Promise<string | null> {
-  const handle = await open(path, "r");
-  try {
-    const buffer = Buffer.allocUnsafe(maxBytes + 1);
-    let offset = 0;
-    while (offset < buffer.length) {
-      const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, offset);
-      if (bytesRead === 0) break;
-      offset += bytesRead;
-    }
-    return offset > maxBytes ? null : buffer.toString("utf8", 0, offset);
-  } finally {
-    await handle.close();
-  }
 }
 
 async function readClaudeWebCache(nowMs = Date.now()): Promise<{
@@ -547,130 +518,39 @@ async function readClaudeWebCache(nowMs = Date.now()): Promise<{
   ageMs: number;
 } | null> {
   try {
-    const text = await readBoundedTextFile(CLAUDE_WEB_CACHE, CLAUDE_WEB_CACHE_MAX_BYTES);
-    return text === null ? null : parseClaudeWebCache(JSON.parse(text), nowMs);
+    return parseClaudeWebCache(JSON.parse(await readFile(CLAUDE_WEB_CACHE, "utf8")), nowMs);
   } catch {
     return null;
   }
 }
 
 async function writeClaudeWebCache(windows: UsageWindow[]): Promise<void> {
-  const temporary = `${CLAUDE_WEB_CACHE}.${process.pid}.${randomBytes(6).toString("hex")}`;
   try {
     await mkdir(dirname(CLAUDE_WEB_CACHE), { recursive: true, mode: 0o700 });
-    const boundedWindows = windows.slice(0, CLAUDE_WEB_CACHE_MAX_WINDOWS);
-    await writeFile(temporary, JSON.stringify({ cachedAt: Date.now(), windows: boundedWindows }), { mode: 0o600 });
-    await rename(temporary, CLAUDE_WEB_CACHE);
+    await writeFile(CLAUDE_WEB_CACHE, JSON.stringify({ cachedAt: Date.now(), windows }), { mode: 0o600 });
   } catch {
-    try {
-      await unlink(temporary);
-    } catch {
-      // Best-effort cache cleanup only.
-    }
+    // Best-effort cache write only.
   }
-}
-
-interface ClaudeWebCacheLock {
-  handle: Awaited<ReturnType<typeof open>>;
-  token: string;
-}
-
-async function createClaudeWebCacheLock(): Promise<ClaudeWebCacheLock> {
-  const token = randomBytes(16).toString("hex");
-  const handle = await open(CLAUDE_WEB_CACHE_LOCK, "wx", 0o600);
-  try {
-    await handle.writeFile(token, "utf8");
-    return { handle, token };
-  } catch (error) {
-    await handle.close();
-    try {
-      await unlink(CLAUDE_WEB_CACHE_LOCK);
-    } catch {
-      // Best-effort cleanup after a failed lock write.
-    }
-    throw error;
-  }
-}
-
-async function acquireClaudeWebCacheLock(): Promise<ClaudeWebCacheLock | undefined> {
-  await mkdir(dirname(CLAUDE_WEB_CACHE_LOCK), { recursive: true, mode: 0o700 });
-  try {
-    return await createClaudeWebCacheLock();
-  } catch (error) {
-    if (!isRecord(error) || error.code !== "EEXIST") return undefined;
-  }
-  try {
-    const lock = await stat(CLAUDE_WEB_CACHE_LOCK);
-    if (Date.now() - lock.mtimeMs <= CLAUDE_WEB_LOCK_MAX_MS) return undefined;
-    await unlink(CLAUDE_WEB_CACHE_LOCK);
-    return await createClaudeWebCacheLock();
-  } catch {
-    return undefined;
-  }
-}
-
-async function releaseClaudeWebCacheLock(lock: ClaudeWebCacheLock): Promise<void> {
-  await lock.handle.close();
-  try {
-    if ((await readFile(CLAUDE_WEB_CACHE_LOCK, "utf8")) === lock.token) {
-      await unlink(CLAUDE_WEB_CACHE_LOCK);
-    }
-  } catch {
-    // The lock was already cleaned up or replaced by another process.
-  }
-}
-
-async function waitForClaudeWebCache(signal: AbortSignal): Promise<UsageWindow[] | null> {
-  const deadline = Date.now() + CLAUDE_WEB_LOCK_WAIT_MS;
-  while (!signal.aborted && Date.now() < deadline) {
-    const cached = await readClaudeWebCache();
-    if (cached) return cached.windows;
-    try {
-      await stat(CLAUDE_WEB_CACHE_LOCK);
-    } catch {
-      return null;
-    }
-    await new Promise<void>((resolve) => {
-      const timer = setTimeout(finish, CLAUDE_WEB_LOCK_POLL_MS);
-      function finish(): void {
-        clearTimeout(timer);
-        signal.removeEventListener("abort", finish);
-        resolve();
-      }
-      signal.addEventListener("abort", finish, { once: true });
-    });
-  }
-  return null;
 }
 
 async function loadClaudeWebUsage(signal: AbortSignal): Promise<UsageWindow[] | null> {
   const cached = await readClaudeWebCache();
-  if (cached && cached.ageMs < CLAUDE_WEB_CACHE_FRESH_MS) return cached.windows;
+  if (cached && cached.ageMs < ANTHROPIC_REFRESH_INTERVAL_MS) return cached.windows;
 
-  const lock = await acquireClaudeWebCacheLock();
-  if (!lock) return cached?.windows ?? await waitForClaudeWebCache(signal);
+  const cookies = await readClaudeDesktopCookies(signal);
+  if (!cookies) return cached?.windows ?? null;
+  let cookie = `sessionKey=${cookies.sessionKey}; lastActiveOrg=${cookies.organizationId}`;
+  if (cookies.clearance) cookie += `; cf_clearance=${cookies.clearance}`;
+  let payload: unknown | null = null;
   try {
-    const refreshedCache = await readClaudeWebCache();
-    if (refreshedCache && refreshedCache.ageMs < CLAUDE_WEB_CACHE_FRESH_MS) {
-      return refreshedCache.windows;
-    }
-    const cookies = await readClaudeDesktopCookies(signal);
-    if (!cookies) return cached?.windows ?? null;
-    let cookie = `sessionKey=${cookies.sessionKey}; lastActiveOrg=${cookies.organizationId}`;
-    if (cookies.clearance) cookie += `; cf_clearance=${cookies.clearance}`;
-    let payload: unknown | null = null;
-    try {
-      payload = await requestClaudeWebUsage(cookies.organizationId, cookie, signal);
-    } catch {
-      // A stale quota-only cache is safer than exposing a transport error.
-    }
-    const windows = payload === null ? null : parseAnthropicUsage(payload);
-    if (!windows) return cached?.windows ?? null;
-    await writeClaudeWebCache(windows);
-    return windows;
-  } finally {
-    await releaseClaudeWebCacheLock(lock);
+    payload = await requestClaudeWebUsage(cookies.organizationId, cookie, signal);
+  } catch {
+    // A stale quota-only cache is safer than exposing a transport error.
   }
+  const windows = payload === null ? null : parseAnthropicUsage(payload);
+  if (!windows) return cached?.windows ?? null;
+  await writeClaudeWebCache(windows);
+  return windows;
 }
 
 async function loadAnthropic(
