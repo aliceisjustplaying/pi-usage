@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import {
+import usageExtension, {
   extractAccountId,
   formatProviderLine,
   formatUsageWindow,
@@ -238,4 +238,74 @@ test("formats compact bars, percentages, countdowns, and partial provider states
     ),
     ["Claude: Fable █████ 100%", "Codex: HTTP 429 │ Grok: /login xai-auth"],
   );
+});
+
+test("polls every minute only while the agent is active", () => {
+  type Handler = (event: unknown, ctx: unknown) => unknown;
+
+  const handlers = new Map<string, Handler>();
+  usageExtension({
+    on(event: string, handler: Handler) {
+      handlers.set(event, handler);
+    },
+    registerCommand() {},
+  } as never);
+
+  const originalSetInterval = globalThis.setInterval;
+  const originalClearInterval = globalThis.clearInterval;
+  const handles: Array<ReturnType<typeof setInterval>> = [];
+  const cleared: Array<ReturnType<typeof setInterval>> = [];
+  const delays: number[] = [];
+
+  globalThis.setInterval = ((callback: () => void, delay?: number) => {
+    const handle = { callback } as unknown as ReturnType<typeof setInterval>;
+    handles.push(handle);
+    delays.push(delay ?? 0);
+    return handle;
+  }) as typeof setInterval;
+  globalThis.clearInterval = ((handle: ReturnType<typeof setInterval>) => {
+    cleared.push(handle);
+  }) as typeof clearInterval;
+
+  const ctx = {
+    hasUI: true,
+    mode: "tui",
+    ui: { setWidget() {} },
+    modelRegistry: {
+      async getProviderAuth() {
+        return undefined;
+      },
+      getProvider() {
+        return undefined;
+      },
+    },
+  };
+  const invoke = (event: string): void => {
+    const handler = handlers.get(event);
+    assert.ok(handler, `missing ${event} handler`);
+    handler({}, ctx);
+  };
+
+  try {
+    invoke("session_start");
+    assert.equal(handles.length, 0);
+
+    invoke("agent_start");
+    assert.deepEqual(delays, [60_000]);
+
+    invoke("agent_start");
+    assert.equal(handles.length, 1, "repeated starts must not create overlapping timers");
+
+    invoke("agent_settled");
+    assert.deepEqual(cleared, [handles[0]]);
+
+    invoke("agent_start");
+    assert.deepEqual(delays, [60_000, 60_000]);
+
+    invoke("session_shutdown");
+    assert.deepEqual(cleared, handles);
+  } finally {
+    globalThis.setInterval = originalSetInterval;
+    globalThis.clearInterval = originalClearInterval;
+  }
 });

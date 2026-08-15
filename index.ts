@@ -443,6 +443,7 @@ export default function usageExtension(pi: ExtensionAPI): void {
   let alive = false;
   let generation = 0;
   let lastRefreshAt = 0;
+  let refreshTimer: ReturnType<typeof setInterval> | undefined;
   let activeController: AbortController | undefined;
   let state: UsageState = {
     anthropic: { kind: "loading" },
@@ -485,18 +486,38 @@ export default function usageExtension(pi: ExtensionAPI): void {
     if (activeController === controller) activeController = undefined;
   };
 
+  const stopRefreshTimer = (): void => {
+    if (refreshTimer === undefined) return;
+    clearInterval(refreshTimer);
+    refreshTimer = undefined;
+  };
+
+  const startRefreshTimer = (ctx: ExtensionContext): void => {
+    if (refreshTimer !== undefined) return;
+    refreshTimer = setInterval(() => {
+      void refresh(ctx, false);
+    }, REFRESH_INTERVAL_MS);
+  };
+
   pi.on("session_start", (_event, ctx) => {
     alive = true;
     lastRefreshAt = 0;
     void refresh(ctx, true);
   });
 
+  pi.on("agent_start", (_event, ctx) => {
+    void refresh(ctx, false);
+    startRefreshTimer(ctx);
+  });
+
   pi.on("agent_settled", (_event, ctx) => {
+    stopRefreshTimer();
     void refresh(ctx, false);
   });
 
   pi.on("session_shutdown", (_event, ctx) => {
     alive = false;
+    stopRefreshTimer();
     generation += 1;
     activeController?.abort();
     activeController = undefined;
