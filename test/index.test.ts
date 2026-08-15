@@ -7,6 +7,7 @@ import usageExtension, {
   formatUsageWindow,
   formatWidget,
   parseAnthropicUsage,
+  parseClaudeWebCache,
   parseCodexUsage,
   parseGrokUsage,
   parseGrokUserId,
@@ -185,6 +186,39 @@ test("handles malformed and partial payloads", () => {
   assert.equal(parseGrokUsage(null), null);
   assert.equal(parseGrokUsage({ config: null }), null);
   assert.equal(parseGrokUsage({ config: { creditUsagePercent: 101 } }), null);
+});
+
+test("validates Claude web cache age, windows, and reset expiry", () => {
+  const now = 1_700_000_000_000;
+  assert.deepEqual(
+    parseClaudeWebCache({
+      cachedAt: now - 30_000,
+      windows: [
+        { label: "5h", usedPercent: 37, resetsAt: now + 60_000 },
+        { label: "expired", usedPercent: 99, resetsAt: now },
+        { label: "\u001b[31mFable\u001b[0m", usedPercent: 88 },
+      ],
+    }, now),
+    {
+      ageMs: 30_000,
+      windows: [
+        { label: "5h", usedPercent: 37, resetsAt: now + 60_000 },
+        { label: "Fable", usedPercent: 88, resetsAt: undefined },
+      ],
+    },
+  );
+  assert.equal(parseClaudeWebCache({ cachedAt: now + 1, windows: [{ label: "5h", usedPercent: 1 }] }, now), null);
+  assert.equal(
+    parseClaudeWebCache({ cachedAt: now - 5 * 60_000 - 1, windows: [{ label: "5h", usedPercent: 1 }] }, now),
+    null,
+  );
+  assert.equal(
+    parseClaudeWebCache({
+      cachedAt: now,
+      windows: Array.from({ length: 33 }, (_, index) => ({ label: `${index}`, usedPercent: index })),
+    }, now),
+    null,
+  );
 });
 
 test("sanitizes provider-controlled labels before rendering", () => {

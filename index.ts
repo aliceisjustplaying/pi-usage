@@ -16,6 +16,8 @@ const CLAUDE_DESKTOP_COOKIE_DB = join(homedir(), "Library/Application Support/Cl
 const CLAUDE_WEB_CACHE = join(homedir(), ".cache/pi-usage/claude-web.json");
 const CLAUDE_WEB_CACHE_LOCK = `${CLAUDE_WEB_CACHE}.lock`;
 const CLAUDE_WEB_CACHE_FRESH_MS = 30_000;
+const CLAUDE_WEB_CACHE_MAX_BYTES = 64 * 1024;
+const CLAUDE_WEB_CACHE_MAX_WINDOWS = 32;
 const CLAUDE_WEB_CACHE_MAX_MS = 24 * 60 * 60_000;
 const CLAUDE_WEB_LOCK_MAX_MS = 30_000;
 const CLAUDE_WEB_LOCK_WAIT_MS = 20_000;
@@ -435,15 +437,18 @@ async function requestClaudeWebUsage(
 ): Promise<unknown | null> {
   return new Promise((resolve, reject) => {
     let settled = false;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
     const finish = (value: unknown | null): void => {
       if (settled) return;
       settled = true;
+      if (timeout) clearTimeout(timeout);
       signal.removeEventListener("abort", onAbort);
       resolve(value);
     };
     const fail = (error: Error): void => {
       if (settled) return;
       settled = true;
+      if (timeout) clearTimeout(timeout);
       signal.removeEventListener("abort", onAbort);
       reject(error);
     };
@@ -456,8 +461,9 @@ async function requestClaudeWebUsage(
         Accept: "application/json",
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
       },
-      timeout: REQUEST_TIMEOUT_MS,
     }, (response) => {
+      response.once("error", fail);
+      response.once("aborted", () => fail(new Error("response aborted")));
       if (response.statusCode !== 200) {
         response.resume();
         response.once("end", () => finish(null));
@@ -484,12 +490,56 @@ async function requestClaudeWebUsage(
     const onAbort = (): void => {
       request.destroy(new Error("aborted"));
     };
+    timeout = setTimeout(() => request.destroy(new Error("timeout")), REQUEST_TIMEOUT_MS);
     signal.addEventListener("abort", onAbort, { once: true });
     request.on("error", fail);
-    request.on("timeout", () => request.destroy(new Error("timeout")));
     if (signal.aborted) onAbort();
     else request.end();
   });
+}
+
+export function parseClaudeWebCache(payload: unknown, nowMs = Date.now()): {
+  windows: UsageWindow[];
+  ageMs: number;
+} | null {
+  if (!isRecord(payload)) return null;
+  const cachedAt = finiteNumber(payload.cachedAt);
+  if (cachedAt === undefined) return null;
+  const ageMs = nowMs - cachedAt;
+  if (
+    ageMs < 0 ||
+    ageMs > CLAUDE_WEB_CACHE_MAX_MS ||
+    !Array.isArray(payload.windows) ||
+    payload.windows.length > CLAUDE_WEB_CACHE_MAX_WINDOWS
+  ) return null;
+  const windows: UsageWindow[] = [];
+  for (const entry of payload.windows) {
+    if (!isRecord(entry)) continue;
+    const label = cleanLabel(entry.label);
+    const usedPercent = finiteNumber(entry.usedPercent);
+    const resetsAt = finiteNumber(entry.resetsAt);
+    if (!label || (usedPercent === undefined && resetsAt === undefined)) continue;
+    if (resetsAt !== undefined && resetsAt <= nowMs) continue;
+    if (resetsAt === undefined && ageMs > ANTHROPIC_REFRESH_INTERVAL_MS) continue;
+    windows.push({ label, usedPercent, resetsAt });
+  }
+  return windows.length > 0 ? { windows, ageMs } : null;
+}
+
+async function readBoundedTextFile(path: string, maxBytes: number): Promise<string | null> {
+  const handle = await open(path, "r");
+  try {
+    const buffer = Buffer.allocUnsafe(maxBytes + 1);
+    let offset = 0;
+    while (offset < buffer.length) {
+      const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, offset);
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+    return offset > maxBytes ? null : buffer.toString("utf8", 0, offset);
+  } finally {
+    await handle.close();
+  }
 }
 
 async function readClaudeWebCache(nowMs = Date.now()): Promise<{
@@ -497,24 +547,8 @@ async function readClaudeWebCache(nowMs = Date.now()): Promise<{
   ageMs: number;
 } | null> {
   try {
-    const payload: unknown = JSON.parse(await readFile(CLAUDE_WEB_CACHE, "utf8"));
-    if (!isRecord(payload)) return null;
-    const cachedAt = finiteNumber(payload.cachedAt);
-    if (cachedAt === undefined) return null;
-    const ageMs = nowMs - cachedAt;
-    if (ageMs < 0 || ageMs > CLAUDE_WEB_CACHE_MAX_MS || !Array.isArray(payload.windows)) return null;
-    const windows: UsageWindow[] = [];
-    for (const entry of payload.windows) {
-      if (!isRecord(entry)) continue;
-      const label = cleanLabel(entry.label);
-      const usedPercent = finiteNumber(entry.usedPercent);
-      const resetsAt = finiteNumber(entry.resetsAt);
-      if (!label || (usedPercent === undefined && resetsAt === undefined)) continue;
-      if (resetsAt !== undefined && resetsAt <= nowMs) continue;
-      if (resetsAt === undefined && ageMs > ANTHROPIC_REFRESH_INTERVAL_MS) continue;
-      windows.push({ label, usedPercent, resetsAt });
-    }
-    return windows.length > 0 ? { windows, ageMs } : null;
+    const text = await readBoundedTextFile(CLAUDE_WEB_CACHE, CLAUDE_WEB_CACHE_MAX_BYTES);
+    return text === null ? null : parseClaudeWebCache(JSON.parse(text), nowMs);
   } catch {
     return null;
   }
@@ -524,7 +558,8 @@ async function writeClaudeWebCache(windows: UsageWindow[]): Promise<void> {
   const temporary = `${CLAUDE_WEB_CACHE}.${process.pid}.${randomBytes(6).toString("hex")}`;
   try {
     await mkdir(dirname(CLAUDE_WEB_CACHE), { recursive: true, mode: 0o700 });
-    await writeFile(temporary, JSON.stringify({ cachedAt: Date.now(), windows }), { mode: 0o600 });
+    const boundedWindows = windows.slice(0, CLAUDE_WEB_CACHE_MAX_WINDOWS);
+    await writeFile(temporary, JSON.stringify({ cachedAt: Date.now(), windows: boundedWindows }), { mode: 0o600 });
     await rename(temporary, CLAUDE_WEB_CACHE);
   } catch {
     try {
