@@ -17,6 +17,10 @@ const CLAUDE_WEB_CACHE = join(homedir(), ".cache/pi-usage/claude-web.json");
 const CLAUDE_WEB_CACHE_MAX_MS = 24 * 60 * 60_000;
 const MACOS_KEYCHAIN_COMMAND = "/usr/bin/security";
 const MACOS_SQLITE_COMMAND = "/usr/bin/sqlite3";
+// The OAuth usage endpoint puts requests without a Claude Code User-Agent in a
+// much stricter bucket that returns persistent 429s.
+const CLAUDE_CODE_USER_AGENT = "claude-code/2.1.285";
+const OPENCODE_GO_USAGE_URL = "https://opencode.ai/zen/go/v1/usage";
 const GROK_BASE_URL = "https://cli-chat-proxy.grok.com/v1";
 const GROK_CLIENT_VERSION = "1.0.3";
 const MAX_RESPONSE_BYTES = 64 * 1024;
@@ -48,6 +52,7 @@ export interface UsageState {
   anthropic: ProviderState;
   codex: ProviderState;
   grok: ProviderState;
+  opencodeGo: ProviderState;
 }
 
 function isRecord(value: unknown): value is UnknownRecord {
@@ -220,6 +225,26 @@ export function parseGrokUsage(payload: unknown): UsageWindow[] | null {
     : null;
 }
 
+function parseOpenCodeGoWindow(value: unknown, label: string): UsageWindow | undefined {
+  if (!isRecord(value)) return undefined;
+  const usedPercent = finiteNumber(value.percent);
+  const resetsAt = parseResetTime(value.resetsAt);
+  if (usedPercent === undefined && resetsAt === undefined) return undefined;
+  return { label, usedPercent, resetsAt };
+}
+
+/** Parse OpenCode Go's rolling (5h), weekly and monthly usage windows. */
+export function parseOpenCodeGoUsage(payload: unknown): UsageWindow[] | null {
+  if (!isRecord(payload) || !isRecord(payload.usage)) return null;
+  const usage = payload.usage;
+  const windows = [
+    parseOpenCodeGoWindow(usage.rolling, "5h"),
+    parseOpenCodeGoWindow(usage.weekly, "Week"),
+    parseOpenCodeGoWindow(usage.monthly, "Month"),
+  ].filter((window): window is UsageWindow => window !== undefined);
+  return windows.length > 0 ? windows : null;
+}
+
 export function parseGrokUserId(payload: unknown): string | undefined {
   if (!isRecord(payload)) return undefined;
   const userId = payload.userId;
@@ -264,7 +289,11 @@ export function formatProviderLine(
 export function formatWidget(state: UsageState, nowMs = Date.now()): string[] {
   return [
     formatProviderLine("Claude", state.anthropic, nowMs),
-    `${formatProviderLine("Codex", state.codex, nowMs)} │ ${formatProviderLine("Grok", state.grok, nowMs)}`,
+    [
+      formatProviderLine("Codex", state.codex, nowMs),
+      formatProviderLine("Grok", state.grok, nowMs),
+      formatProviderLine("Go", state.opencodeGo, nowMs),
+    ].join(" │ "),
   ];
 }
 
@@ -569,6 +598,7 @@ async function loadAnthropic(
   const result = await requestJson("https://api.anthropic.com/api/oauth/usage", {
     Authorization: `Bearer ${resolved.auth.apiKey}`,
     "anthropic-beta": "oauth-2025-04-20",
+    "User-Agent": CLAUDE_CODE_USER_AGENT,
     Accept: "application/json",
   }, signal);
   if (result.kind === "error") {
@@ -663,6 +693,24 @@ async function loadGrok(ctx: ExtensionContext, signal: AbortSignal): Promise<Pro
   return windows ? { kind: "ready", windows } : { kind: "error", message: "usage unavailable" };
 }
 
+async function loadOpenCodeGo(ctx: ExtensionContext, signal: AbortSignal): Promise<ProviderState> {
+  let resolved: ProviderAuthResult | undefined;
+  try {
+    resolved = await ctx.modelRegistry.getProviderAuth("opencode-go");
+  } catch {
+    return { kind: "error", message: "auth unavailable" };
+  }
+  if (!resolved?.auth.apiKey) return { kind: "login", command: "/login opencode-go" };
+
+  const result = await requestJson(OPENCODE_GO_USAGE_URL, {
+    Authorization: `Bearer ${resolved.auth.apiKey}`,
+    Accept: "application/json",
+  }, signal);
+  if (result.kind === "error") return result;
+  const windows = parseOpenCodeGoUsage(result.payload);
+  return windows ? { kind: "ready", windows } : { kind: "error", message: "malformed response" };
+}
+
 export interface UsageExtensionDependencies {
   loadClaudeWebUsage?: (signal: AbortSignal) => Promise<UsageWindow[] | null>;
 }
@@ -677,11 +725,13 @@ export default function usageExtension(
     anthropic: 0,
     codex: 0,
     grok: 0,
+    opencodeGo: 0,
   };
   let lastRefreshAt: Record<keyof UsageState, number> = {
     anthropic: 0,
     codex: 0,
     grok: 0,
+    opencodeGo: 0,
   };
   let refreshTimer: ReturnType<typeof setInterval> | undefined;
   let activeControllers: Partial<Record<keyof UsageState, AbortController>> = {};
@@ -693,6 +743,7 @@ export default function usageExtension(
     anthropic: { kind: "loading" },
     codex: { kind: "loading" },
     grok: { kind: "loading" },
+    opencodeGo: { kind: "loading" },
   };
 
   const render = (ctx: ExtensionContext): void => {
@@ -776,6 +827,7 @@ export default function usageExtension(
       loadAnthropic(ctx, signal, loadWebUsage));
     schedule("codex", REFRESH_INTERVAL_MS, loadCodex);
     schedule("grok", REFRESH_INTERVAL_MS, loadGrok);
+    schedule("opencodeGo", REFRESH_INTERVAL_MS, loadOpenCodeGo);
     await Promise.all(requests);
   };
 
@@ -794,11 +846,12 @@ export default function usageExtension(
 
   pi.on("session_start", (_event, ctx) => {
     alive = true;
-    lastRefreshAt = { anthropic: 0, codex: 0, grok: 0 };
+    lastRefreshAt = { anthropic: 0, codex: 0, grok: 0, opencodeGo: 0 };
     state = {
       anthropic: { kind: "loading" },
       codex: { kind: "loading" },
       grok: { kind: "loading" },
+      opencodeGo: { kind: "loading" },
     };
     mountWidget(ctx);
     void refresh(ctx, true);
@@ -817,7 +870,7 @@ export default function usageExtension(
   pi.on("session_shutdown", (_event, ctx) => {
     alive = false;
     stopRefreshTimer();
-    for (const provider of ["anthropic", "codex", "grok"] as const) {
+    for (const provider of ["anthropic", "codex", "grok", "opencodeGo"] as const) {
       generation[provider] += 1;
       activeControllers[provider]?.abort();
     }

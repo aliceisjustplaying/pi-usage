@@ -10,6 +10,7 @@ import usageExtension, {
   parseCodexUsage,
   parseGrokUsage,
   parseGrokUserId,
+  parseOpenCodeGoUsage,
 } from "../index.ts";
 
 test("parses Anthropic legacy usage buckets", () => {
@@ -156,6 +157,25 @@ test("parses Grok weekly credits, fresh periods, and legacy monthly fallback", (
   );
 });
 
+test("parses OpenCode Go rolling, weekly and monthly windows", () => {
+  assert.deepEqual(
+    parseOpenCodeGoUsage({
+      usage: {
+        rolling: { status: "ok", percent: 3, resetsAt: "2026-09-20T05:35:53.613Z" },
+        weekly: { status: "rate-limited", percent: 100, resetsAt: "2026-09-21T00:00:00.000Z" },
+        monthly: { status: "ok", percent: 0 },
+      },
+    }),
+    [
+      { label: "5h", usedPercent: 3, resetsAt: Date.parse("2026-09-20T05:35:53.613Z") },
+      { label: "Week", usedPercent: 100, resetsAt: Date.parse("2026-09-21T00:00:00.000Z") },
+      { label: "Month", usedPercent: 0, resetsAt: undefined },
+    ],
+  );
+  assert.equal(parseOpenCodeGoUsage({ usage: {} }), null);
+  assert.equal(parseOpenCodeGoUsage({ error: { type: "AuthError" } }), null);
+});
+
 test("accepts only bounded header-safe Grok user IDs", () => {
   assert.equal(parseGrokUserId({ userId: "user-123" }), "user-123");
   assert.equal(parseGrokUserId({ userId: "user\r\nx-userid: attacker" }), undefined);
@@ -233,10 +253,11 @@ test("formats compact bars, percentages, countdowns, and partial provider states
         anthropic: { kind: "ready", windows: [{ label: "Fable", usedPercent: 100 }] },
         codex: { kind: "error", message: "HTTP 429" },
         grok: { kind: "login", command: "/login xai-auth" },
+        opencodeGo: { kind: "ready", windows: [{ label: "Week", usedPercent: 100 }] },
       },
       now,
     ),
-    ["Claude: Fable █████ 100%", "Codex: HTTP 429 │ Grok: /login xai-auth"],
+    ["Claude: Fable █████ 100%", "Codex: HTTP 429 │ Grok: /login xai-auth │ Go: Week █████ 100%"],
   );
 });
 
@@ -253,9 +274,11 @@ test("falls back to Claude Desktop web usage when the OAuth endpoint is rate lim
   let mountedWidget: { render(width: number): string[] } | undefined;
   const originalFetch = globalThis.fetch;
 
-  globalThis.fetch = (async (input: string | URL | Request) => {
+  const anthropicUserAgents: Array<string | null> = [];
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
     const url = String(input);
     assert.match(url, /api\.anthropic\.com/);
+    anthropicUserAgents.push(new Headers(init?.headers).get("user-agent"));
     return Response.json(
       { error: { type: "rate_limit_error", message: "Rate limited. Please try again later." } },
       { status: 429 },
@@ -311,6 +334,7 @@ test("falls back to Claude Desktop web usage when the OAuth endpoint is rate lim
     }
 
     assert.equal(fallbackRequests, 1);
+    assert.match(anthropicUserAgents[0] ?? "", /^claude-code\/\d+\.\d+\.\d+$/);
     assert.equal(claudeLine(), "Claude: 5h ░░░░░ 6% · Week ███░░ 51% · Fable █████ 100%");
   } finally {
     globalThis.fetch = originalFetch;
@@ -373,6 +397,9 @@ test("updates a mounted widget in place and retains Claude usage when polling is
     if (url.endsWith("/user")) return Response.json({ userId: "user-123" });
     if (url.includes("/billing")) {
       return Response.json({ config: { creditUsagePercent: 42 } });
+    }
+    if (url.includes("/zen/go/v1/usage")) {
+      return Response.json({ usage: { weekly: { status: "ok", percent: 60 } } });
     }
     throw new Error(`unexpected request: ${url}`);
   }) as typeof fetch;
@@ -446,7 +473,7 @@ test("updates a mounted widget in place and retains Claude usage when polling is
         anthropicRequestsAfterMinute: 1,
         claudeBefore: "Claude: 5h █████ 100% · Fable █████ 100%",
         claudeAfter: "Claude: 5h █████ 100% · Fable █████ 100%",
-        codexAfter: "Codex: Primary ██░░░ 32% │ Grok: Week ██░░░ 42%",
+        codexAfter: "Codex: Primary ██░░░ 32% │ Grok: Week ██░░░ 42% │ Go: Week ███░░ 60%",
       },
     );
   } finally {
