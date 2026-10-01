@@ -7,6 +7,7 @@ import usageExtension, {
   formatUsageWindow,
   formatWidget,
   parseAnthropicUsage,
+  parseCodexCredits,
   parseCodexUsage,
   parseGrokUsage,
   parseGrokUserId,
@@ -68,6 +69,14 @@ test("prefers generic account windows while retaining a missing legacy window", 
       { label: "Week", usedPercent: 22, resetsAt: undefined },
     ],
   );
+});
+
+test("parses the Codex credit balance", () => {
+  assert.equal(parseCodexCredits({ credits: { has_credits: true, unlimited: false, balance: "61246.065" } }), 61246.065);
+  assert.equal(parseCodexCredits({ credits: { has_credits: true, unlimited: true, balance: "0" } }), "unlimited");
+  assert.equal(parseCodexCredits({ credits: { has_credits: false, unlimited: false, balance: "0" } }), undefined);
+  assert.equal(parseCodexCredits({ credits: null }), undefined);
+  assert.equal(parseCodexCredits({}), undefined);
 });
 
 test("parses only Codex shared limits and ignores additional meters", () => {
@@ -257,7 +266,7 @@ test("formats compact bars, percentages, countdowns, and partial provider states
       },
       now,
     ),
-    ["Claude: Fable █████ 100%", "Codex: HTTP 429 │ Grok: /login xai-auth │ Go: Week █████ 100%"],
+    ["Claude: Fable █████ 100%", "Codex: HTTP 429 │ Go: Week █████ 100%"],
   );
 });
 
@@ -392,6 +401,7 @@ test("updates a mounted widget in place and retains Claude usage when polling is
       codexRequests += 1;
       return Response.json({
         rate_limit: { primary_window: { used_percent: codexRequests === 1 ? 31 : 32 } },
+        credits: { has_credits: true, unlimited: false, balance: "61246.0650680000" },
       });
     }
     if (url.endsWith("/user")) return Response.json({ userId: "user-123" });
@@ -473,7 +483,7 @@ test("updates a mounted widget in place and retains Claude usage when polling is
         anthropicRequestsAfterMinute: 1,
         claudeBefore: "Claude: 5h █████ 100% · Fable █████ 100%",
         claudeAfter: "Claude: 5h █████ 100% · Fable █████ 100%",
-        codexAfter: "Codex: Primary ██░░░ 32% │ Grok: Week ██░░░ 42% │ Go: Week ███░░ 60%",
+        codexAfter: "Codex: Primary ██░░░ 32% · Credits 61,246 │ Go: Week ███░░ 60%",
       },
     );
   } finally {

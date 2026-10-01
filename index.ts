@@ -23,6 +23,10 @@ const CLAUDE_CODE_USER_AGENT = "claude-code/2.1.285";
 const OPENCODE_GO_USAGE_URL = "https://opencode.ai/zen/go/v1/usage";
 const GROK_BASE_URL = "https://cli-chat-proxy.grok.com/v1";
 const GROK_CLIENT_VERSION = "1.0.3";
+// Grok is hidden for now: no requests are made and no segment is rendered.
+const GROK_ENABLED = false;
+// Claude's model-scoped weekly limit for Fable; set false to hide that segment.
+const FABLE_ENABLED = true;
 const MAX_RESPONSE_BYTES = 64 * 1024;
 
 type UnknownRecord = Record<string, unknown>;
@@ -46,7 +50,9 @@ type ProviderState =
   | { kind: "loading" }
   | { kind: "login"; command?: string }
   | { kind: "error"; message: string }
-  | { kind: "ready"; windows: UsageWindow[] };
+  | { kind: "ready"; windows: UsageWindow[]; credits?: CreditBalance };
+
+export type CreditBalance = number | "unlimited";
 
 export interface UsageState {
   anthropic: ProviderState;
@@ -190,6 +196,22 @@ export function parseCodexUsage(payload: unknown, nowMs = Date.now()): UsageWind
   return windows.length > 0 ? windows : null;
 }
 
+/** Parse the Codex credit balance, if the account has credits. */
+export function parseCodexCredits(payload: unknown): CreditBalance | undefined {
+  if (!isRecord(payload) || !isRecord(payload.credits)) return undefined;
+  const credits = payload.credits;
+  if (credits.unlimited === true) return "unlimited";
+  const balance = finiteNumber(credits.balance);
+  if (balance === undefined || balance < 0) return undefined;
+  if (credits.has_credits === false && balance === 0) return undefined;
+  return balance;
+}
+
+export function formatCredits(credits: CreditBalance): string {
+  if (credits === "unlimited") return "Credits ∞";
+  return `Credits ${Math.floor(credits).toLocaleString("en-US")}`;
+}
+
 function centsValue(value: unknown): number | undefined {
   if (!isRecord(value)) return undefined;
   const cents = value.val === undefined ? 0 : finiteNumber(value.val);
@@ -283,15 +305,22 @@ export function formatProviderLine(
   if (state.kind === "loading") return `${name}: loading…`;
   if (state.kind === "login") return `${name}: ${state.command ?? "/login for OAuth"}`;
   if (state.kind === "error") return `${name}: ${state.message}`;
-  return `${name}: ${state.windows.map((window) => formatUsageWindow(window, nowMs)).join(" · ")}`;
+  const parts = state.windows.map((window) => formatUsageWindow(window, nowMs));
+  if (state.credits !== undefined) parts.push(formatCredits(state.credits));
+  return `${name}: ${parts.join(" · ")}`;
+}
+
+function visibleClaudeState(state: ProviderState): ProviderState {
+  if (FABLE_ENABLED || state.kind !== "ready") return state;
+  return { ...state, windows: state.windows.filter((window) => window.label !== "Fable") };
 }
 
 export function formatWidget(state: UsageState, nowMs = Date.now()): string[] {
   return [
-    formatProviderLine("Claude", state.anthropic, nowMs),
+    formatProviderLine("Claude", visibleClaudeState(state.anthropic), nowMs),
     [
       formatProviderLine("Codex", state.codex, nowMs),
-      formatProviderLine("Grok", state.grok, nowMs),
+      ...(GROK_ENABLED ? [formatProviderLine("Grok", state.grok, nowMs)] : []),
       formatProviderLine("Go", state.opencodeGo, nowMs),
     ].join(" │ "),
   ];
@@ -632,7 +661,9 @@ async function loadCodex(ctx: ExtensionContext, signal: AbortSignal): Promise<Pr
   const result = await requestJson(codexUsageUrl(baseUrl), headers, signal);
   if (result.kind === "error") return result;
   const windows = parseCodexUsage(result.payload);
-  return windows ? { kind: "ready", windows } : { kind: "error", message: "malformed response" };
+  const credits = parseCodexCredits(result.payload);
+  if (!windows && credits === undefined) return { kind: "error", message: "malformed response" };
+  return { kind: "ready", windows: windows ?? [], ...(credits !== undefined ? { credits } : {}) };
 }
 
 async function resolveGrokAuth(ctx: ExtensionContext): Promise<ProviderAuthResult | undefined> {
@@ -826,7 +857,7 @@ export default function usageExtension(
     schedule("anthropic", ANTHROPIC_REFRESH_INTERVAL_MS, (ctx, signal) =>
       loadAnthropic(ctx, signal, loadWebUsage));
     schedule("codex", REFRESH_INTERVAL_MS, loadCodex);
-    schedule("grok", REFRESH_INTERVAL_MS, loadGrok);
+    if (GROK_ENABLED) schedule("grok", REFRESH_INTERVAL_MS, loadGrok);
     schedule("opencodeGo", REFRESH_INTERVAL_MS, loadOpenCodeGo);
     await Promise.all(requests);
   };
