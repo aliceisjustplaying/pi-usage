@@ -1,5 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Container, Text } from "@earendil-works/pi-tui";
+import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { execFile } from "node:child_process";
 import { createDecipheriv, pbkdf2Sync } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
@@ -327,14 +327,20 @@ export function formatWidget(state: UsageState, nowMs = Date.now()): string[] {
 }
 
 // ---- one-line widget ----
-// Position replaces labels: each provider always lists its windows in the same
-// order (Claude 5h/week/Fable, Codex week + credits, Go 5h/week/month), so the
-// line stays short enough for a phone. Only numbers that need attention get
-// color, and only red ones get a reset countdown. /usage prints the detail.
+// One line, never wrapped. Providers are colored badges; each number is % used,
+// with a faint label (5h, w, F, mo) and a faint time until it resets. Numbers
+// that need attention sit on a filled yellow or red block. When the screen is
+// too narrow, detail drops in this order: labels, then reset times for numbers
+// that are fine. /usage prints the full detail.
 
 export type Tone = "dim" | "text" | "warning" | "error";
-export type Paint = (tone: Tone, text: string) => string;
-const plain: Paint = (_tone, text) => text;
+export type ProviderTag = "Cl" | "Cx" | "Gk" | "Go";
+export interface LineStyle {
+  badge(tag: ProviderTag): string;
+  dim(text: string): string;
+  value(tone: Tone, text: string): string;
+}
+export const plainStyle: LineStyle = { badge: (tag) => tag, dim: (text) => text, value: (_tone, text) => text };
 
 const HOUR_MS = 3_600_000;
 const DAY_MS = 24 * HOUR_MS;
@@ -361,6 +367,23 @@ export function windowTone(window: UsageWindow, nowMs = Date.now()): Tone {
   return used >= 80 ? "warning" : "text";
 }
 
+function shortLabel(label: string): string {
+  if (label === "Week") return "w";
+  if (label === "Month") return "mo";
+  if (/^\d+[hd]$/.test(label)) return label;
+  return cleanLabel(label, "?").slice(0, 1);
+}
+
+/** Time until reset in one unit: 45m, 9h, 39h, 6d. */
+export function shortReset(resetsAt: number | undefined, nowMs: number): string {
+  if (resetsAt === undefined || !Number.isFinite(resetsAt)) return "";
+  const remaining = Math.max(0, resetsAt - nowMs);
+  if (remaining < 60_000) return "<1m";
+  if (remaining < HOUR_MS) return `${Math.ceil(remaining / 60_000)}m`;
+  if (remaining < 48 * HOUR_MS) return `${Math.ceil(remaining / HOUR_MS)}h`;
+  return `${Math.round(remaining / DAY_MS)}d`;
+}
+
 function compactCredits(credits: CreditBalance): string {
   if (credits === "unlimited") return "∞";
   const whole = Math.floor(credits);
@@ -368,30 +391,79 @@ function compactCredits(credits: CreditBalance): string {
   return `${(whole / 1000).toFixed(whole < 10_000 ? 1 : 0)}k`;
 }
 
-function compactProvider(tag: string, state: ProviderState, nowMs: number, paint: Paint): string {
-  const head = paint("dim", tag);
-  if (state.kind === "loading") return `${head} ${paint("dim", "…")}`;
-  if (state.kind === "login") return `${head} ${paint("warning", "login")}`;
-  if (state.kind === "error") return `${head} ${paint("error", "!")}`;
+interface Detail {
+  labels: boolean;
+  resets: "all" | "trouble";
+}
+const DETAIL_LEVELS: Detail[] = [
+  { labels: true, resets: "all" },
+  { labels: false, resets: "all" },
+  { labels: false, resets: "trouble" },
+];
+
+function compactProvider(tag: ProviderTag, state: ProviderState, nowMs: number, style: LineStyle, detail: Detail): string {
+  const head = style.badge(tag);
+  if (state.kind === "loading") return `${head} ${style.dim("…")}`;
+  if (state.kind === "login") return `${head} ${style.value("warning", "login")}`;
+  if (state.kind === "error") return `${head} ${style.value("error", "!")}`;
   const parts = state.windows.map((window) => {
     const tone = windowTone(window, nowMs);
     const used = window.usedPercent;
-    const number = paint(tone, used === undefined ? "?" : String(Math.round(Math.min(100, Math.max(0, used)))));
-    return tone === "error" ? number + paint("dim", compactCountdown(window.resetsAt, nowMs)) : number;
+    const value = style.value(tone, used === undefined ? "?" : String(Math.round(Math.min(100, Math.max(0, used)))));
+    const label = detail.labels ? style.dim(shortLabel(window.label)) + " " : "";
+    const showReset = detail.resets === "all" || tone === "warning" || tone === "error";
+    const reset = showReset ? shortReset(window.resetsAt, nowMs) : "";
+    return label + value + (reset ? style.dim(`·${reset}`) : "");
   });
   if (state.credits !== undefined) {
-    parts.push(paint(state.credits !== "unlimited" && state.credits <= 0 ? "error" : "dim", compactCredits(state.credits)));
+    const empty = state.credits !== "unlimited" && state.credits <= 0;
+    parts.push(style.dim("$") + style.value(empty ? "error" : "text", compactCredits(state.credits)));
   }
   return `${head} ${parts.join(" ")}`;
 }
 
-export function formatCompactWidget(state: UsageState, nowMs = Date.now(), paint: Paint = plain): string {
+function compactLine(state: UsageState, nowMs: number, style: LineStyle, detail: Detail): string {
   return [
-    compactProvider("Cl", visibleClaudeState(state.anthropic), nowMs, paint),
-    compactProvider("Cx", state.codex, nowMs, paint),
-    ...(GROK_ENABLED ? [compactProvider("Gk", state.grok, nowMs, paint)] : []),
-    compactProvider("Go", state.opencodeGo, nowMs, paint),
-  ].join(paint("dim", " · "));
+    compactProvider("Cl", visibleClaudeState(state.anthropic), nowMs, style, detail),
+    compactProvider("Cx", state.codex, nowMs, style, detail),
+    ...(GROK_ENABLED ? [compactProvider("Gk", state.grok, nowMs, style, detail)] : []),
+    compactProvider("Go", state.opencodeGo, nowMs, style, detail),
+  ].join(" ");
+}
+
+/** The most detailed line that fits in `width` columns (all detail when width is omitted). */
+export function formatCompactWidget(
+  state: UsageState,
+  nowMs = Date.now(),
+  style: LineStyle = plainStyle,
+  width?: number,
+): string {
+  let line = "";
+  for (const detail of DETAIL_LEVELS) {
+    line = compactLine(state, nowMs, style, detail);
+    if (width === undefined || visibleWidth(line) <= width) return line;
+  }
+  return truncateToWidth(line, width ?? line.length, "…");
+}
+
+// True-color blocks; the theme has no per-brand colors.
+const rgbBlock = (fg: string, bg: string) => (text: string) => `\x1b[1;38;2;${fg};48;2;${bg}m${text}\x1b[0m`;
+const BADGES: Record<ProviderTag, (text: string) => string> = {
+  Cl: rgbBlock("255;255;255", "193;95;60"),
+  Cx: rgbBlock("255;255;255", "16;163;127"),
+  Gk: rgbBlock("255;255;255", "60;60;60"),
+  Go: rgbBlock("255;255;255", "59;111;216"),
+};
+const RED_BLOCK = rgbBlock("255;255;255", "208;49;45");
+const YELLOW_BLOCK = rgbBlock("90;69;0", "245;215;110");
+
+export function terminalStyle(dim: (text: string) => string): LineStyle {
+  return {
+    badge: (tag) => BADGES[tag](` ${tag} `),
+    dim,
+    value: (tone, text) =>
+      tone === "error" ? RED_BLOCK(text) : tone === "warning" ? YELLOW_BLOCK(text) : tone === "dim" ? dim(text) : text,
+  };
 }
 
 function isOAuth(
@@ -843,9 +915,7 @@ export default function usageExtension(
   let activeControllers: Partial<Record<keyof UsageState, AbortController>> = {};
   let activeRefreshes: Partial<Record<keyof UsageState, Promise<void>>> = {};
   let widgetLines: string[] = [];
-  let widgetText: Text[] | undefined;
   let requestWidgetRender: (() => void) | undefined;
-  let widgetPaint: Paint = plain;
   let state: UsageState = {
     anthropic: { kind: "loading" },
     codex: { kind: "loading" },
@@ -855,16 +925,11 @@ export default function usageExtension(
 
   const render = (ctx: ExtensionContext): void => {
     if (!alive || ctx.hasUI === false) return;
-    const nextLines = [formatCompactWidget(state, Date.now(), widgetPaint)];
-    const changedLines = nextLines.map((line, index) => line !== widgetLines[index]);
-    if (nextLines.length === widgetLines.length && changedLines.every((changed) => !changed)) return;
+    const nextLines = [formatCompactWidget(state, Date.now())];
+    if (nextLines[0] === widgetLines[0]) return;
     widgetLines = nextLines;
-
-    if (ctx.mode === "tui" && widgetText) {
-      for (const [index, line] of widgetLines.entries()) {
-        if (changedLines[index]) widgetText[index]?.setText(line);
-      }
-      requestWidgetRender?.();
+    if (ctx.mode === "tui" && requestWidgetRender) {
+      requestWidgetRender();
       return;
     }
     ctx.ui.setWidget(WIDGET_ID, widgetLines, { placement: "belowEditor" });
@@ -872,21 +937,20 @@ export default function usageExtension(
 
   const mountWidget = (ctx: ExtensionContext): void => {
     if (ctx.hasUI === false) return;
-    widgetLines = [formatCompactWidget(state, Date.now(), widgetPaint)];
+    widgetLines = [formatCompactWidget(state, Date.now())];
     if (ctx.mode !== "tui") {
       ctx.ui.setWidget(WIDGET_ID, widgetLines, { placement: "belowEditor" });
       return;
     }
 
     ctx.ui.setWidget(WIDGET_ID, (tui, theme) => {
-      widgetPaint = (tone, text) =>
-        tone === "text" ? text : tone === "error" ? theme.bold(theme.fg("error", text)) : theme.fg(tone, text);
-      widgetLines = [formatCompactWidget(state, Date.now(), widgetPaint)];
-      const container = new Container();
-      widgetText = widgetLines.map((line) => new Text(line, 1, 0));
-      for (const line of widgetText) container.addChild(line);
+      const style = terminalStyle((text) => theme.fg("dim", text));
       requestWidgetRender = () => tui.requestRender();
-      return container;
+      // Re-fit on every draw so a resize (phone ↔ laptop) picks the right detail level.
+      return {
+        render: (width: number) => [" " + formatCompactWidget(state, Date.now(), style, Math.max(1, width - 1))],
+        invalidate() {},
+      };
     }, { placement: "belowEditor" });
   };
 
@@ -986,7 +1050,6 @@ export default function usageExtension(
     }
     activeControllers = {};
     activeRefreshes = {};
-    widgetText = undefined;
     requestWidgetRender = undefined;
     widgetLines = [];
     ctx.ui.setWidget(WIDGET_ID, undefined);

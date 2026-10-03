@@ -1,3 +1,4 @@
+import { visibleWidth } from "@earendil-works/pi-tui";
 import test from "node:test";
 import assert from "node:assert/strict";
 
@@ -7,6 +8,7 @@ import usageExtension, {
   formatUsageWindow,
   formatWidget,
   formatCompactWidget,
+  plainStyle,
   parseAnthropicUsage,
   parseCodexCredits,
   parseCodexUsage,
@@ -16,7 +18,16 @@ import usageExtension, {
 } from "../index.ts";
 
 
-const segment = (line: string | undefined, index: number): string => (line ?? "").split(" · ")[index] ?? "";
+const TAGS = ["Cl", "Cx", "Gk", "Go"];
+const segment = (line: string | undefined, index: number): string => {
+  const plain = (line ?? "").replace(/\x1b\[[0-9;]*m/g, "").replace(/\s+/g, " ").trim();
+  const groups: string[] = [];
+  for (const word of plain.split(" ")) {
+    if (TAGS.includes(word)) groups.push(word);
+    else if (groups.length > 0) groups[groups.length - 1] += ` ${word}`;
+  }
+  return groups[index] ?? "";
+};
 const plainTheme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
 
 test("parses Anthropic legacy usage buckets", () => {
@@ -275,35 +286,42 @@ test("formats compact bars, percentages, countdowns, and partial provider states
   );
 });
 
-test("compact line colors a number only when it needs attention", () => {
+test("compact line marks trouble, and drops labels then calm reset times to stay on one line", () => {
   const now = 1_700_000_000_000;
   const hour = 3_600_000;
-  const tag = (tone: string, text: string) => (tone === "text" || tone === "dim" ? text : `<${tone}:${text}>`);
-  const line = formatCompactWidget(
-    {
-      anthropic: {
-        kind: "ready",
-        windows: [
-          { label: "5h", usedPercent: 10, resetsAt: now + 3 * hour },
-          { label: "Week", usedPercent: 81, resetsAt: now + 9 * hour }, // late in the week: fine
-          { label: "Fable", usedPercent: 60, resetsAt: now + 5 * 24 * hour }, // 2 days in: too fast
-        ],
-      },
-      codex: { kind: "ready", windows: [{ label: "Week", usedPercent: 0, resetsAt: now + 6 * 24 * hour }], credits: 0 },
-      grok: { kind: "loading" },
-      opencodeGo: {
-        kind: "ready",
-        windows: [
-          { label: "5h", usedPercent: 0, resetsAt: now + 4 * hour },
-          { label: "Week", usedPercent: 100, resetsAt: now + 39 * hour },
-          { label: "Month", usedPercent: 85, resetsAt: now + 7 * 24 * hour }, // 3 weeks in: fine
-        ],
-      },
+  const state = {
+    anthropic: {
+      kind: "ready" as const,
+      windows: [
+        { label: "5h", usedPercent: 10, resetsAt: now + 3 * hour },
+        { label: "Week", usedPercent: 81, resetsAt: now + 9 * hour }, // late in the week: fine
+        { label: "Fable", usedPercent: 60, resetsAt: now + 5 * 24 * hour }, // 2 days in: too fast
+      ],
     },
-    now,
-    tag,
+    codex: { kind: "ready" as const, windows: [{ label: "Week", usedPercent: 0, resetsAt: now + 6 * 24 * hour }], credits: 0 },
+    grok: { kind: "loading" as const },
+    opencodeGo: {
+      kind: "ready" as const,
+      windows: [
+        { label: "5h", usedPercent: 0, resetsAt: now + 4 * hour },
+        { label: "Week", usedPercent: 100, resetsAt: now + 39 * hour },
+        { label: "Month", usedPercent: 85, resetsAt: now + 7 * 24 * hour }, // 3 weeks in: fine
+      ],
+    },
+  };
+  const marked = { ...plainStyle, value: (tone: string, text: string) => (tone === "text" || tone === "dim" ? text : `<${tone}:${text}>`) };
+  assert.equal(
+    formatCompactWidget(state, now, marked),
+    "Cl 5h 10·3h w 81·9h F <warning:60>·5d Cx w 0·6d $<error:0> Go 5h 0·4h w <error:100>·39h mo 85·7d",
   );
-  assert.equal(line, "Cl 10 81 <warning:60> · Cx 0 <error:0> · Go 0 <error:100> 1d15h 85");
+
+  const full = formatCompactWidget(state, now);
+  const noLabels = "Cl 10·3h 81·9h 60·5d Cx 0·6d $0 Go 0·4h 100·39h 85·7d";
+  const phone = "Cl 10 81 60·5d Cx 0 $0 Go 0 100·39h 85";
+  assert.equal(formatCompactWidget(state, now, plainStyle, full.length), full);
+  assert.equal(formatCompactWidget(state, now, plainStyle, full.length - 1), noLabels);
+  assert.equal(formatCompactWidget(state, now, plainStyle, 44), phone);
+  assert.ok(visibleWidth(formatCompactWidget(state, now, plainStyle, 20)) <= 20);
 });
 
 test("falls back to Claude Desktop web usage when the OAuth endpoint is rate limited", async () => {
@@ -380,7 +398,7 @@ test("falls back to Claude Desktop web usage when the OAuth endpoint is rate lim
 
     assert.equal(fallbackRequests, 1);
     assert.match(anthropicUserAgents[0] ?? "", /^claude-code\/\d+\.\d+\.\d+$/);
-    assert.equal(segment(claudeLine(), 0), "Cl 6 51 100");
+    assert.equal(segment(claudeLine(), 0), "Cl 5h 6 w 51 F 100");
   } finally {
     globalThis.fetch = originalFetch;
     handlers.get("session_shutdown")?.({}, ctx);
@@ -522,9 +540,9 @@ test("updates a mounted widget in place and retains Claude usage when polling is
         widgetRegistrations: 1,
         changedLineRenders: 1,
         anthropicRequestsAfterMinute: 1,
-        claudeBefore: "Cl 100 100",
-        claudeAfter: "Cl 100 100",
-        codexAfter: "Cx 32 61k · Go 60",
+        claudeBefore: "Cl 5h 100 F 100",
+        claudeAfter: "Cl 5h 100 F 100",
+        codexAfter: "Cx P 32 $61k · Go w 60",
         usageDetail: "Claude: 5h █████ 100% · Fable █████ 100%\nCodex: Primary ██░░░ 32% · Credits 61,246 │ Go: Week ███░░ 60%",
       },
     );
@@ -609,7 +627,7 @@ test("a one-minute provider poll does not invalidate a slow Claude refresh", asy
     await waitFor(() => codexAuthRequests === 2);
 
     resolveAnthropicAuth({ auth: { apiKey: "oauth-token" }, source: "OAuth" });
-    await waitFor(() => segment(visibleLines()[0], 0) === "Cl 64");
+    await waitFor(() => segment(visibleLines()[0], 0) === "Cl 5h 64");
 
     assert.equal(anthropicAuthRequests, 1, "the slow Claude auth request should be coalesced");
   } finally {
