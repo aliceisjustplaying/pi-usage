@@ -6,6 +6,7 @@ import usageExtension, {
   formatProviderLine,
   formatUsageWindow,
   formatWidget,
+  formatCompactWidget,
   parseAnthropicUsage,
   parseCodexCredits,
   parseCodexUsage,
@@ -13,6 +14,10 @@ import usageExtension, {
   parseGrokUserId,
   parseOpenCodeGoUsage,
 } from "../index.ts";
+
+
+const segment = (line: string | undefined, index: number): string => (line ?? "").split(" · ")[index] ?? "";
+const plainTheme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
 
 test("parses Anthropic legacy usage buckets", () => {
   assert.deepEqual(
@@ -270,6 +275,37 @@ test("formats compact bars, percentages, countdowns, and partial provider states
   );
 });
 
+test("compact line colors a number only when it needs attention", () => {
+  const now = 1_700_000_000_000;
+  const hour = 3_600_000;
+  const tag = (tone: string, text: string) => (tone === "text" || tone === "dim" ? text : `<${tone}:${text}>`);
+  const line = formatCompactWidget(
+    {
+      anthropic: {
+        kind: "ready",
+        windows: [
+          { label: "5h", usedPercent: 10, resetsAt: now + 3 * hour },
+          { label: "Week", usedPercent: 81, resetsAt: now + 9 * hour }, // late in the week: fine
+          { label: "Fable", usedPercent: 60, resetsAt: now + 5 * 24 * hour }, // 2 days in: too fast
+        ],
+      },
+      codex: { kind: "ready", windows: [{ label: "Week", usedPercent: 0, resetsAt: now + 6 * 24 * hour }], credits: 0 },
+      grok: { kind: "loading" },
+      opencodeGo: {
+        kind: "ready",
+        windows: [
+          { label: "5h", usedPercent: 0, resetsAt: now + 4 * hour },
+          { label: "Week", usedPercent: 100, resetsAt: now + 39 * hour },
+          { label: "Month", usedPercent: 85, resetsAt: now + 7 * 24 * hour }, // 3 weeks in: fine
+        ],
+      },
+    },
+    now,
+    tag,
+  );
+  assert.equal(line, "Cl 10 81 <warning:60> · Cx 0 <error:0> · Go 0 <error:100> 1d15h 85");
+});
+
 test("falls back to Claude Desktop web usage when the OAuth endpoint is rate limited", async () => {
   type Handler = (event: unknown, ctx: unknown) => unknown;
   type WidgetContent = string[] | ((tui: unknown, theme: unknown) => { render(width: number): string[] });
@@ -319,7 +355,7 @@ test("falls back to Claude Desktop web usage when the OAuth endpoint is rate lim
     ui: {
       setWidget(_key: string, content: WidgetContent | undefined) {
         if (typeof content === "function") {
-          mountedWidget = content({ requestRender() {} }, {});
+          mountedWidget = content({ requestRender() {} }, plainTheme);
         }
       },
     },
@@ -338,13 +374,13 @@ test("falls back to Claude Desktop web usage when the OAuth endpoint is rate lim
 
   try {
     handlers.get("session_start")?.({}, ctx);
-    for (let attempt = 0; attempt < 50 && claudeLine().includes("loading"); attempt += 1) {
+    for (let attempt = 0; attempt < 50 && segment(claudeLine(), 0).includes("…"); attempt += 1) {
       await new Promise<void>((resolve) => setImmediate(resolve));
     }
 
     assert.equal(fallbackRequests, 1);
     assert.match(anthropicUserAgents[0] ?? "", /^claude-code\/\d+\.\d+\.\d+$/);
-    assert.equal(claudeLine(), "Claude: 5h ░░░░░ 6% · Week ███░░ 51% · Fable █████ 100%");
+    assert.equal(segment(claudeLine(), 0), "Cl 6 51 100");
   } finally {
     globalThis.fetch = originalFetch;
     handlers.get("session_shutdown")?.({}, ctx);
@@ -414,15 +450,19 @@ test("updates a mounted widget in place and retains Claude usage when polling is
     throw new Error(`unexpected request: ${url}`);
   }) as typeof fetch;
 
+  const notifications: string[] = [];
   const ctx = {
     hasUI: true,
     mode: "tui",
     ui: {
+      notify(message: string) {
+        notifications.push(message);
+      },
       setWidget(_key: string, content: WidgetContent | undefined) {
         if (content === undefined) return;
         widgetUpdates.push(content);
         if (typeof content === "function") {
-          mountedWidget = content({ requestRender: () => { renderRequests += 1; } }, {});
+          mountedWidget = content({ requestRender: () => { renderRequests += 1; } }, plainTheme);
         }
       },
     },
@@ -456,13 +496,13 @@ test("updates a mounted widget in place and retains Claude usage when polling is
     const start = handlers.get("session_start");
     assert.ok(start);
     start({}, ctx);
-    await waitFor(() => visibleLines()[0]?.includes("Fable") === true);
+    await waitFor(() => segment(visibleLines()[0], 0) !== "" && !segment(visibleLines()[0], 0).includes("…"));
 
-    const claudeBefore = visibleLines()[0];
+    const claudeBefore = segment(visibleLines()[0], 0);
     const rendersBefore = renderRequests;
     nowMs += 60_000;
     handlers.get("agent_settled")?.({}, ctx);
-    await waitFor(() => codexRequests === 2 && visibleLines()[1]?.includes("32%") === true);
+    await waitFor(() => codexRequests === 2 && segment(visibleLines()[0], 1).includes("32"));
     const anthropicRequestsAfterMinute = anthropicRequests;
 
     assert.ok(usageCommand);
@@ -474,16 +514,18 @@ test("updates a mounted widget in place and retains Claude usage when polling is
         changedLineRenders: renderRequests - rendersBefore,
         anthropicRequestsAfterMinute,
         claudeBefore,
-        claudeAfter: visibleLines()[0],
-        codexAfter: visibleLines()[1],
+        claudeAfter: segment(visibleLines()[0], 0),
+        codexAfter: `${segment(visibleLines()[0], 1)} · ${segment(visibleLines()[0], 2)}`,
+        usageDetail: notifications.at(-1),
       },
       {
         widgetRegistrations: 1,
         changedLineRenders: 1,
         anthropicRequestsAfterMinute: 1,
-        claudeBefore: "Claude: 5h █████ 100% · Fable █████ 100%",
-        claudeAfter: "Claude: 5h █████ 100% · Fable █████ 100%",
-        codexAfter: "Codex: Primary ██░░░ 32% · Credits 61,246 │ Go: Week ███░░ 60%",
+        claudeBefore: "Cl 100 100",
+        claudeAfter: "Cl 100 100",
+        codexAfter: "Cx 32 61k · Go 60",
+        usageDetail: "Claude: 5h █████ 100% · Fable █████ 100%\nCodex: Primary ██░░░ 32% · Credits 61,246 │ Go: Week ███░░ 60%",
       },
     );
   } finally {
@@ -530,7 +572,7 @@ test("a one-minute provider poll does not invalidate a slow Claude refresh", asy
     ui: {
       setWidget(_key: string, content: WidgetContent | undefined) {
         if (typeof content === "function") {
-          mountedWidget = content({ requestRender() {} }, {});
+          mountedWidget = content({ requestRender() {} }, plainTheme);
         }
       },
     },
@@ -559,7 +601,7 @@ test("a one-minute provider poll does not invalidate a slow Claude refresh", asy
 
   try {
     handlers.get("session_start")?.({}, ctx);
-    await waitFor(() => codexAuthRequests === 1 && visibleLines()[1]?.includes("/login") === true);
+    await waitFor(() => codexAuthRequests === 1 && segment(visibleLines()[0], 1) === "Cx login");
     await new Promise<void>((resolve) => setImmediate(resolve));
 
     nowMs += 60_000;
@@ -567,10 +609,9 @@ test("a one-minute provider poll does not invalidate a slow Claude refresh", asy
     await waitFor(() => codexAuthRequests === 2);
 
     resolveAnthropicAuth({ auth: { apiKey: "oauth-token" }, source: "OAuth" });
-    await waitFor(() => visibleLines()[0]?.includes("64%") === true);
+    await waitFor(() => segment(visibleLines()[0], 0) === "Cl 64");
 
     assert.equal(anthropicAuthRequests, 1, "the slow Claude auth request should be coalesced");
-    assert.match(visibleLines()[0] ?? "", /^Claude: 5h ███░░ 64%$/);
   } finally {
     globalThis.fetch = originalFetch;
     Date.now = originalDateNow;
@@ -594,7 +635,14 @@ test("a dead or rejected Codex login asks for /login openai-codex instead of an 
 
   for (const { name, auth, codexStatus } of cases) {
     const handlers = new Map<string, Handler>();
-    usageExtension({ on: (event: string, handler: Handler) => handlers.set(event, handler), registerCommand() {} } as never);
+    let usageCommand: ((args: string, ctx: unknown) => Promise<void>) | undefined;
+    usageExtension({
+      on: (event: string, handler: Handler) => handlers.set(event, handler),
+      registerCommand: (_name: string, command: { handler: typeof usageCommand }) => {
+        usageCommand = command.handler;
+      },
+    } as never);
+    const notifications: string[] = [];
     const originalFetch = globalThis.fetch;
     globalThis.fetch = (async () => new Response("{}", { status: codexStatus })) as typeof fetch;
     let mountedWidget: { render(width: number): string[] } | undefined;
@@ -602,8 +650,9 @@ test("a dead or rejected Codex login asks for /login openai-codex instead of an 
       hasUI: true,
       mode: "tui",
       ui: {
+        notify: (message: string) => notifications.push(message),
         setWidget(_key: string, content: unknown) {
-          if (typeof content === "function") mountedWidget = content({ requestRender() {} }, {});
+          if (typeof content === "function") mountedWidget = content({ requestRender() {} }, plainTheme);
         },
       },
       modelRegistry: {
@@ -611,13 +660,15 @@ test("a dead or rejected Codex login asks for /login openai-codex instead of an 
         getProvider: () => undefined,
       },
     };
-    const codexLine = () => mountedWidget?.render(200).map((line) => line.trim())[1] ?? "";
+    const codexLine = () => segment(mountedWidget?.render(200)[0]?.trim(), 1);
     try {
       handlers.get("session_start")?.({}, ctx);
-      for (let attempt = 0; attempt < 50 && !codexLine().includes("/login"); attempt += 1) {
+      for (let attempt = 0; attempt < 50 && codexLine() !== "Cx login"; attempt += 1) {
         await new Promise<void>((resolve) => setImmediate(resolve));
       }
-      assert.match(codexLine(), /Codex: \/login openai-codex for usage/, name);
+      assert.equal(codexLine(), "Cx login", name);
+      await usageCommand?.("", ctx);
+      assert.match(notifications.at(-1) ?? "", /Codex: \/login openai-codex for usage/, name);
     } finally {
       globalThis.fetch = originalFetch;
       handlers.get("session_shutdown")?.({}, ctx);

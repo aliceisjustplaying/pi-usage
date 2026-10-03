@@ -326,6 +326,74 @@ export function formatWidget(state: UsageState, nowMs = Date.now()): string[] {
   ];
 }
 
+// ---- one-line widget ----
+// Position replaces labels: each provider always lists its windows in the same
+// order (Claude 5h/week/Fable, Codex week + credits, Go 5h/week/month), so the
+// line stays short enough for a phone. Only numbers that need attention get
+// color, and only red ones get a reset countdown. /usage prints the detail.
+
+export type Tone = "dim" | "text" | "warning" | "error";
+export type Paint = (tone: Tone, text: string) => string;
+const plain: Paint = (_tone, text) => text;
+
+const HOUR_MS = 3_600_000;
+const DAY_MS = 24 * HOUR_MS;
+
+function windowLengthMs(label: string): number | undefined {
+  if (label === "Week") return 7 * DAY_MS;
+  if (label === "Month") return 30 * DAY_MS;
+  const match = /^(\d+)([hd])$/.exec(label);
+  if (match) return Number(match[1]) * (match[2] === "h" ? HOUR_MS : DAY_MS);
+  return undefined;
+}
+
+/** Red when (nearly) maxed; yellow when usage is running ahead of the clock. */
+export function windowTone(window: UsageWindow, nowMs = Date.now()): Tone {
+  const used = window.usedPercent;
+  if (used === undefined) return "dim";
+  if (used >= 95) return "error";
+  // Model-scoped limits (Fable) are weekly.
+  const length = windowLengthMs(window.label) ?? (window.resetsAt !== undefined ? 7 * DAY_MS : undefined);
+  if (length !== undefined && window.resetsAt !== undefined) {
+    const elapsed = Math.min(1, Math.max(0, 1 - (window.resetsAt - nowMs) / length));
+    return used >= 50 && used > elapsed * 100 + 10 ? "warning" : "text";
+  }
+  return used >= 80 ? "warning" : "text";
+}
+
+function compactCredits(credits: CreditBalance): string {
+  if (credits === "unlimited") return "∞";
+  const whole = Math.floor(credits);
+  if (whole < 1000) return String(whole);
+  return `${(whole / 1000).toFixed(whole < 10_000 ? 1 : 0)}k`;
+}
+
+function compactProvider(tag: string, state: ProviderState, nowMs: number, paint: Paint): string {
+  const head = paint("dim", tag);
+  if (state.kind === "loading") return `${head} ${paint("dim", "…")}`;
+  if (state.kind === "login") return `${head} ${paint("warning", "login")}`;
+  if (state.kind === "error") return `${head} ${paint("error", "!")}`;
+  const parts = state.windows.map((window) => {
+    const tone = windowTone(window, nowMs);
+    const used = window.usedPercent;
+    const number = paint(tone, used === undefined ? "?" : String(Math.round(Math.min(100, Math.max(0, used)))));
+    return tone === "error" ? number + paint("dim", compactCountdown(window.resetsAt, nowMs)) : number;
+  });
+  if (state.credits !== undefined) {
+    parts.push(paint(state.credits !== "unlimited" && state.credits <= 0 ? "error" : "dim", compactCredits(state.credits)));
+  }
+  return `${head} ${parts.join(" ")}`;
+}
+
+export function formatCompactWidget(state: UsageState, nowMs = Date.now(), paint: Paint = plain): string {
+  return [
+    compactProvider("Cl", visibleClaudeState(state.anthropic), nowMs, paint),
+    compactProvider("Cx", state.codex, nowMs, paint),
+    ...(GROK_ENABLED ? [compactProvider("Gk", state.grok, nowMs, paint)] : []),
+    compactProvider("Go", state.opencodeGo, nowMs, paint),
+  ].join(paint("dim", " · "));
+}
+
 function isOAuth(
   auth: ProviderAuthResult | undefined,
   allowAnthropicEnv: boolean,
@@ -777,6 +845,7 @@ export default function usageExtension(
   let widgetLines: string[] = [];
   let widgetText: Text[] | undefined;
   let requestWidgetRender: (() => void) | undefined;
+  let widgetPaint: Paint = plain;
   let state: UsageState = {
     anthropic: { kind: "loading" },
     codex: { kind: "loading" },
@@ -786,7 +855,7 @@ export default function usageExtension(
 
   const render = (ctx: ExtensionContext): void => {
     if (!alive || ctx.hasUI === false) return;
-    const nextLines = formatWidget(state);
+    const nextLines = [formatCompactWidget(state, Date.now(), widgetPaint)];
     const changedLines = nextLines.map((line, index) => line !== widgetLines[index]);
     if (nextLines.length === widgetLines.length && changedLines.every((changed) => !changed)) return;
     widgetLines = nextLines;
@@ -803,13 +872,16 @@ export default function usageExtension(
 
   const mountWidget = (ctx: ExtensionContext): void => {
     if (ctx.hasUI === false) return;
-    widgetLines = formatWidget(state);
+    widgetLines = [formatCompactWidget(state, Date.now(), widgetPaint)];
     if (ctx.mode !== "tui") {
       ctx.ui.setWidget(WIDGET_ID, widgetLines, { placement: "belowEditor" });
       return;
     }
 
-    ctx.ui.setWidget(WIDGET_ID, (tui) => {
+    ctx.ui.setWidget(WIDGET_ID, (tui, theme) => {
+      widgetPaint = (tone, text) =>
+        tone === "text" ? text : tone === "error" ? theme.bold(theme.fg("error", text)) : theme.fg(tone, text);
+      widgetLines = [formatCompactWidget(state, Date.now(), widgetPaint)];
       const container = new Container();
       widgetText = widgetLines.map((line) => new Text(line, 1, 0));
       for (const line of widgetText) container.addChild(line);
@@ -921,9 +993,10 @@ export default function usageExtension(
   });
 
   pi.registerCommand("usage", {
-    description: "Refresh subscription quota usage",
+    description: "Refresh subscription quota usage and show the details",
     handler: async (_args, ctx) => {
       await refresh(ctx, true);
+      ctx.ui.notify(formatWidget(state).join("\n"), "info");
     },
   });
 }
