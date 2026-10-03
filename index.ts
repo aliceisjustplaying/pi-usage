@@ -1,4 +1,4 @@
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ThemeColor } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { execFile } from "node:child_process";
 import { createDecipheriv, pbkdf2Sync } from "node:crypto";
@@ -339,6 +339,8 @@ export interface LineStyle {
   badge(tag: ProviderTag): string;
   dim(text: string): string;
   value(tone: Tone, text: string): string;
+  strong?(text: string): string;
+  thinking?(level: string, text: string): string;
 }
 export const plainStyle: LineStyle = { badge: (tag) => tag, dim: (text) => text, value: (_tone, text) => text };
 
@@ -393,7 +395,8 @@ function compactCredits(credits: CreditBalance): string {
 
 interface Detail {
   labels: boolean;
-  resets: "all" | "trouble";
+  resets: "all" | "trouble" | "none";
+  credits?: boolean;
 }
 const DETAIL_LEVELS: Detail[] = [
   { labels: true, resets: "all" },
@@ -411,11 +414,11 @@ function compactProvider(tag: ProviderTag, state: ProviderState, nowMs: number, 
     const used = window.usedPercent;
     const value = style.value(tone, used === undefined ? "?" : String(Math.round(Math.min(100, Math.max(0, used)))));
     const label = detail.labels ? style.dim(shortLabel(window.label)) + " " : "";
-    const showReset = detail.resets === "all" || tone === "warning" || tone === "error";
+    const showReset = detail.resets === "all" || (detail.resets === "trouble" && (tone === "warning" || tone === "error"));
     const reset = showReset ? shortReset(window.resetsAt, nowMs) : "";
     return label + value + (reset ? style.dim(`·${reset}`) : "");
   });
-  if (state.credits !== undefined) {
+  if (state.credits !== undefined && detail.credits !== false) {
     const empty = state.credits !== "unlimited" && state.credits <= 0;
     parts.push(style.dim("$") + style.value(empty ? "error" : "text", compactCredits(state.credits)));
   }
@@ -446,6 +449,145 @@ export function formatCompactWidget(
   return truncateToWidth(line, width ?? line.length, "…");
 }
 
+// ---- footer: model, context, folder, usage on one line ----
+
+const PROVIDER_SHORT: Record<string, string> = {
+  anthropic: "ant",
+  openai: "oai",
+  "openai-codex": "oai-cx",
+  "opencode-go": "oc-go",
+  opencode: "oc",
+  "xai-auth": "xai",
+  xai: "xai",
+  baseten: "bt",
+  openrouter: "or",
+  google: "goog",
+  "google-gemini-cli": "goog",
+  "google-antigravity": "goog-ag",
+  "vercel-ai-gateway": "vgw",
+};
+
+export function shortProvider(provider: string): string {
+  return PROVIDER_SHORT[provider] ?? provider;
+}
+
+/** claude-fable-5-1 -> fable-5-1; drops trailing -YYYYMMDD dates. */
+export function shortModel(id: string): string {
+  return id.replace(/^claude-/, "").replace(/-\d{8}$/, "");
+}
+
+/** Fish-style: ~/src/a/pi-usage -> ~/s/a/pi-usage. */
+export function fishPath(cwd: string, home: string): string {
+  const path = home && (cwd === home || cwd.startsWith(home + "/")) ? "~" + cwd.slice(home.length) : cwd;
+  const parts = path.split("/");
+  return parts
+    .map((part, index) => {
+      if (index === parts.length - 1 || part === "" || part === "~") return part;
+      return part.startsWith(".") ? part.slice(0, 2) : part.slice(0, 1);
+    })
+    .join("/");
+}
+
+function baseName(cwd: string, home: string): string {
+  if (cwd === home) return "~";
+  return cwd.split("/").filter(Boolean).at(-1) ?? cwd;
+}
+
+export interface FooterInput {
+  provider?: string;
+  model?: string;
+  thinking?: string;
+  contextPercent?: number | null;
+  cwd: string;
+  home: string;
+  branch?: string | null;
+  statuses?: string[];
+}
+
+interface FooterDetail {
+  usage: Detail;
+  branch: boolean;
+  folder: "fish" | "base" | "none";
+  thinking: boolean;
+  provider: boolean;
+  model: boolean;
+}
+
+const FOOTER_LEVELS: FooterDetail[] = (() => {
+  const levels: FooterDetail[] = [];
+  let d: FooterDetail = {
+    usage: { labels: true, resets: "all" },
+    branch: true,
+    folder: "fish",
+    thinking: true,
+    provider: true,
+    model: true,
+  };
+  const push = (change: (d: FooterDetail) => FooterDetail) => {
+    d = change(d);
+    levels.push(d);
+  };
+  levels.push(d);
+  push((d) => ({ ...d, usage: { ...d.usage, labels: false } }));
+  push((d) => ({ ...d, branch: false }));
+  push((d) => ({ ...d, usage: { ...d.usage, resets: "trouble" } }));
+  push((d) => ({ ...d, folder: "base" }));
+  push((d) => ({ ...d, thinking: false }));
+  push((d) => ({ ...d, provider: false }));
+  push((d) => ({ ...d, folder: "none" }));
+  push((d) => ({ ...d, usage: { ...d.usage, credits: false } }));
+  push((d) => ({ ...d, usage: { ...d.usage, resets: "none" } }));
+  push((d) => ({ ...d, model: false }));
+  return levels;
+})();
+
+function contextTone(percent: number): Tone {
+  if (percent >= 90) return "error";
+  if (percent >= 70) return "warning";
+  return "text";
+}
+
+function footerLine(input: FooterInput, state: UsageState, nowMs: number, style: LineStyle, detail: FooterDetail): string {
+  const sep = style.dim(" │ ");
+  const head: string[] = [];
+  if (detail.model && input.model) {
+    const model = style.strong ? style.strong(shortModel(input.model)) : shortModel(input.model);
+    head.push(detail.provider && input.provider ? style.dim(`${shortProvider(input.provider)}/`) + model : model);
+  }
+  if (detail.thinking && input.thinking) {
+    head.push(style.thinking ? style.thinking(input.thinking, input.thinking) : input.thinking);
+  }
+  if (input.contextPercent !== undefined) {
+    const percent = input.contextPercent;
+    head.push(percent === null ? style.dim("?%") : style.value(contextTone(percent), `${Math.round(percent)}%`));
+  }
+  for (const status of input.statuses ?? []) head.push(style.value("warning", cleanLabel(status)));
+
+  const sections = [head.join(" ")];
+  if (detail.folder !== "none") {
+    const folder = detail.folder === "fish" ? fishPath(input.cwd, input.home) : baseName(input.cwd, input.home);
+    sections.push(style.dim(detail.branch && input.branch ? `${folder} ${input.branch}` : folder));
+  }
+  sections.push(compactLine(state, nowMs, style, detail.usage));
+  return sections.filter(Boolean).join(sep);
+}
+
+/** The most detailed footer that fits in `width` columns (all detail when width is omitted). */
+export function formatFooter(
+  input: FooterInput,
+  state: UsageState,
+  nowMs = Date.now(),
+  style: LineStyle = plainStyle,
+  width?: number,
+): string {
+  let line = "";
+  for (const detail of FOOTER_LEVELS) {
+    line = footerLine(input, state, nowMs, style, detail);
+    if (width === undefined || visibleWidth(line) <= width) return line;
+  }
+  return truncateToWidth(line, width ?? line.length, "…");
+}
+
 // True-color blocks; the theme has no per-brand colors.
 const rgbBlock = (fg: string, bg: string) => (text: string) => `\x1b[1;38;2;${fg};48;2;${bg}m${text}\x1b[0m`;
 const BADGES: Record<ProviderTag, (text: string) => string> = {
@@ -457,8 +599,12 @@ const BADGES: Record<ProviderTag, (text: string) => string> = {
 const RED_BLOCK = rgbBlock("255;255;255", "208;49;45");
 const YELLOW_BLOCK = rgbBlock("90;69;0", "245;215;110");
 
-export function terminalStyle(dim: (text: string) => string): LineStyle {
+export function terminalStyle(
+  dim: (text: string) => string,
+  extra: Pick<LineStyle, "strong" | "thinking"> = {},
+): LineStyle {
   return {
+    ...extra,
     badge: (tag) => BADGES[tag](` ${tag} `),
     dim,
     value: (tone, text) =>
@@ -916,6 +1062,7 @@ export default function usageExtension(
   let activeRefreshes: Partial<Record<keyof UsageState, Promise<void>>> = {};
   let widgetLines: string[] = [];
   let requestWidgetRender: (() => void) | undefined;
+  let footerCtx: ExtensionContext | undefined;
   let state: UsageState = {
     anthropic: { kind: "loading" },
     codex: { kind: "loading" },
@@ -943,15 +1090,46 @@ export default function usageExtension(
       return;
     }
 
-    ctx.ui.setWidget(WIDGET_ID, (tui, theme) => {
-      const style = terminalStyle((text) => theme.fg("dim", text));
+    // In the TUI, usage lives in a one-line footer that replaces pi's built-in
+    // footer: model, thinking, context %, extension statuses, folder, usage.
+    ctx.ui.setWidget(WIDGET_ID, undefined);
+    footerCtx = ctx;
+    ctx.ui.setFooter((tui, theme, footerData) => {
+      const thinkingColor = (level: string): ThemeColor =>
+        (`thinking${level.charAt(0).toUpperCase()}${level.slice(1)}` as ThemeColor);
+      const style = terminalStyle((text) => theme.fg("dim", text), {
+        strong: (text) => theme.bold(text),
+        thinking: (level, text) => {
+          try {
+            return theme.fg(thinkingColor(level), text);
+          } catch {
+            return text;
+          }
+        },
+      });
       requestWidgetRender = () => tui.requestRender();
-      // Re-fit on every draw so a resize (phone ↔ laptop) picks the right detail level.
+      const unsubscribe = footerData.onBranchChange(() => tui.requestRender());
       return {
-        render: (width: number) => [" " + formatCompactWidget(state, Date.now(), style, Math.max(1, width - 1))],
+        dispose: unsubscribe,
         invalidate() {},
+        render: (width: number) => {
+          const current = footerCtx ?? ctx;
+          const model = current.model;
+          const input: FooterInput = {
+            provider: model?.provider,
+            model: model?.id,
+            thinking: model?.reasoning ? pi.getThinkingLevel() : undefined,
+            contextPercent: current.getContextUsage()?.percent,
+            cwd: current.cwd,
+            home: homedir(),
+            branch: footerData.getGitBranch(),
+            statuses: [...footerData.getExtensionStatuses().values()],
+          };
+          // Re-fit on every draw so a resize (phone <-> laptop) picks the right detail level.
+          return [" " + formatFooter(input, state, Date.now(), style, Math.max(1, width - 1))];
+        },
       };
-    }, { placement: "belowEditor" });
+    });
   };
 
   const refresh = async (ctx: ExtensionContext, force: boolean): Promise<void> => {
@@ -1031,6 +1209,14 @@ export default function usageExtension(
     void refresh(ctx, true);
   });
 
+  const redrawFooter = (_event: unknown, ctx: ExtensionContext) => {
+    footerCtx = ctx;
+    requestWidgetRender?.();
+  };
+  pi.on("model_select", redrawFooter);
+  pi.on("thinking_level_select", redrawFooter);
+  pi.on("turn_end", redrawFooter);
+
   pi.on("agent_start", (_event, ctx) => {
     void refresh(ctx, false);
     startRefreshTimer(ctx);
@@ -1053,6 +1239,8 @@ export default function usageExtension(
     requestWidgetRender = undefined;
     widgetLines = [];
     ctx.ui.setWidget(WIDGET_ID, undefined);
+    if (footerCtx) ctx.ui.setFooter(undefined);
+    footerCtx = undefined;
   });
 
   pi.registerCommand("usage", {

@@ -8,6 +8,7 @@ import usageExtension, {
   formatUsageWindow,
   formatWidget,
   formatCompactWidget,
+  formatFooter,
   plainStyle,
   parseAnthropicUsage,
   parseCodexCredits,
@@ -28,6 +29,8 @@ const segment = (line: string | undefined, index: number): string => {
   }
   return groups[index] ?? "";
 };
+const footerData = { getGitBranch: () => null, getExtensionStatuses: () => new Map<string, string>(), onBranchChange: () => () => {} };
+type FooterFactory = (tui: unknown, theme: unknown, data: unknown) => { render(width: number): string[] };
 const plainTheme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
 
 test("parses Anthropic legacy usage buckets", () => {
@@ -324,6 +327,37 @@ test("compact line marks trouble, and drops labels then calm reset times to stay
   assert.ok(visibleWidth(formatCompactWidget(state, now, plainStyle, 20)) <= 20);
 });
 
+test("footer puts model, context and a fish-style folder before usage, and shrinks to fit", () => {
+  const now = 1_700_000_000_000;
+  const hour = 3_600_000;
+  const state = {
+    anthropic: { kind: "ready" as const, windows: [{ label: "5h", usedPercent: 13, resetsAt: now + 3 * hour }, { label: "Week", usedPercent: 81, resetsAt: now + 10 * hour }] },
+    codex: { kind: "ready" as const, windows: [{ label: "Week", usedPercent: 0, resetsAt: now + 6 * 24 * hour }], credits: 59_402 },
+    grok: { kind: "loading" as const },
+    opencodeGo: { kind: "ready" as const, windows: [{ label: "Week", usedPercent: 100, resetsAt: now + 39 * hour }] },
+  };
+  const input = {
+    provider: "anthropic",
+    model: "claude-fable-5-1",
+    thinking: "low",
+    contextPercent: 12.4,
+    cwd: "/Users/me/src/a/pi-usage",
+    home: "/Users/me",
+    branch: "main",
+    statuses: ["interrupt mode ON"],
+  };
+  const laptop = formatFooter(input, state, now);
+  assert.equal(
+    laptop,
+    "ant/fable-5-1 low 12% interrupt mode ON │ ~/s/a/pi-usage main │ Cl 5h 13·3h w 81·10h Cx w 0·6d $59k Go w 100·39h",
+  );
+  for (const width of [80, 45, 20]) {
+    assert.ok(visibleWidth(formatFooter(input, state, now, plainStyle, width)) <= width, `width ${width}`);
+  }
+  // Phone: the model, thinking, folder and calm reset times give way before the usage numbers.
+  assert.equal(formatFooter({ ...input, statuses: [] }, state, now, plainStyle, 45), "fable-5-1 12% │ Cl 13 81 Cx 0 $59k Go 100·39h");
+});
+
 test("falls back to Claude Desktop web usage when the OAuth endpoint is rate limited", async () => {
   type Handler = (event: unknown, ctx: unknown) => unknown;
   type WidgetContent = string[] | ((tui: unknown, theme: unknown) => { render(width: number): string[] });
@@ -370,11 +404,16 @@ test("falls back to Claude Desktop web usage when the OAuth endpoint is rate lim
   const ctx = {
     hasUI: true,
     mode: "tui",
+    cwd: "/tmp/project",
+    getContextUsage: () => undefined,
     ui: {
       setWidget(_key: string, content: WidgetContent | undefined) {
         if (typeof content === "function") {
           mountedWidget = content({ requestRender() {} }, plainTheme);
         }
+      },
+      setFooter(factory: FooterFactory | undefined) {
+        if (factory) mountedWidget = factory({ requestRender() {} }, plainTheme, footerData);
       },
     },
     modelRegistry: {
@@ -472,6 +511,8 @@ test("updates a mounted widget in place and retains Claude usage when polling is
   const ctx = {
     hasUI: true,
     mode: "tui",
+    cwd: "/tmp/project",
+    getContextUsage: () => undefined,
     ui: {
       notify(message: string) {
         notifications.push(message);
@@ -482,6 +523,11 @@ test("updates a mounted widget in place and retains Claude usage when polling is
         if (typeof content === "function") {
           mountedWidget = content({ requestRender: () => { renderRequests += 1; } }, plainTheme);
         }
+      },
+      setFooter(factory: FooterFactory | undefined) {
+        if (!factory) return;
+        widgetUpdates.push(factory as never);
+        mountedWidget = factory({ requestRender: () => { renderRequests += 1; } }, plainTheme, footerData);
       },
     },
     modelRegistry: {
@@ -587,11 +633,16 @@ test("a one-minute provider poll does not invalidate a slow Claude refresh", asy
   const ctx = {
     hasUI: true,
     mode: "tui",
+    cwd: "/tmp/project",
+    getContextUsage: () => undefined,
     ui: {
       setWidget(_key: string, content: WidgetContent | undefined) {
         if (typeof content === "function") {
           mountedWidget = content({ requestRender() {} }, plainTheme);
         }
+      },
+      setFooter(factory: FooterFactory | undefined) {
+        if (factory) mountedWidget = factory({ requestRender() {} }, plainTheme, footerData);
       },
     },
     modelRegistry: {
@@ -667,10 +718,15 @@ test("a dead or rejected Codex login asks for /login openai-codex instead of an 
     const ctx = {
       hasUI: true,
       mode: "tui",
+      cwd: "/tmp/project",
+      getContextUsage: () => undefined,
       ui: {
         notify: (message: string) => notifications.push(message),
         setWidget(_key: string, content: unknown) {
           if (typeof content === "function") mountedWidget = content({ requestRender() {} }, plainTheme);
+        },
+        setFooter(factory: FooterFactory | undefined) {
+          if (factory) mountedWidget = factory({ requestRender() {} }, plainTheme, footerData);
         },
       },
       modelRegistry: {
@@ -724,7 +780,9 @@ test("polls every minute only while the agent is active", () => {
   const ctx = {
     hasUI: true,
     mode: "tui",
-    ui: { setWidget() {} },
+    cwd: "/tmp/project",
+    getContextUsage: () => undefined,
+    ui: { setWidget() {}, setFooter() {} },
     modelRegistry: {
       async getProviderAuth() {
         return undefined;
