@@ -578,6 +578,53 @@ test("a one-minute provider poll does not invalidate a slow Claude refresh", asy
   }
 });
 
+test("a dead or rejected Codex login asks for /login openai-codex instead of an error", async () => {
+  type Handler = (event: unknown, ctx: unknown) => unknown;
+  type ResolvedAuth = { auth: { apiKey: string }; source: string };
+  const cases: Array<{ name: string; auth: () => Promise<ResolvedAuth>; codexStatus: number }> = [
+    {
+      name: "refresh token already used",
+      auth: async () => {
+        throw new Error("OAuth refresh failed for openai-codex: OpenAI Codex token refresh failed (401): refresh_token_reused");
+      },
+      codexStatus: 200,
+    },
+    { name: "usage endpoint rejects the token", auth: async () => ({ auth: { apiKey: "a.b.c" }, source: "OAuth" }), codexStatus: 401 },
+  ];
+
+  for (const { name, auth, codexStatus } of cases) {
+    const handlers = new Map<string, Handler>();
+    usageExtension({ on: (event: string, handler: Handler) => handlers.set(event, handler), registerCommand() {} } as never);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => new Response("{}", { status: codexStatus })) as typeof fetch;
+    let mountedWidget: { render(width: number): string[] } | undefined;
+    const ctx = {
+      hasUI: true,
+      mode: "tui",
+      ui: {
+        setWidget(_key: string, content: unknown) {
+          if (typeof content === "function") mountedWidget = content({ requestRender() {} }, {});
+        },
+      },
+      modelRegistry: {
+        getProviderAuth: async (provider: string) => (provider === "openai-codex" ? auth() : undefined),
+        getProvider: () => undefined,
+      },
+    };
+    const codexLine = () => mountedWidget?.render(200).map((line) => line.trim())[1] ?? "";
+    try {
+      handlers.get("session_start")?.({}, ctx);
+      for (let attempt = 0; attempt < 50 && !codexLine().includes("/login"); attempt += 1) {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+      assert.match(codexLine(), /Codex: \/login openai-codex for usage/, name);
+    } finally {
+      globalThis.fetch = originalFetch;
+      handlers.get("session_shutdown")?.({}, ctx);
+    }
+  }
+});
+
 test("polls every minute only while the agent is active", () => {
   type Handler = (event: unknown, ctx: unknown) => unknown;
 

@@ -641,14 +641,21 @@ async function loadAnthropic(
   return windows ? { kind: "ready", windows } : { kind: "error", message: "malformed response" };
 }
 
+// Usage comes from the legacy Codex login (chatgpt.com/backend-api/wham/usage).
+// The newer "Sign in with ChatGPT" login (provider "openai") is scoped to
+// api.openai.com/v1 and has no usage endpoint, so it can't replace this; keep
+// both logins. Same ChatGPT account, so the numbers are the same.
+const CODEX_LOGIN: ProviderState = { kind: "login", command: "/login openai-codex for usage" };
+
 async function loadCodex(ctx: ExtensionContext, signal: AbortSignal): Promise<ProviderState> {
   let resolved: ProviderAuthResult | undefined;
   try {
     resolved = await ctx.modelRegistry.getProviderAuth("openai-codex");
   } catch {
-    return { kind: "error", message: "auth unavailable" };
+    // Usually a dead refresh token ("already been used"): only a new login fixes it.
+    return CODEX_LOGIN;
   }
-  if (!isOAuth(resolved, false)) return { kind: "login" };
+  if (!isOAuth(resolved, false)) return CODEX_LOGIN;
 
   const headers: Record<string, string> = {
     Authorization: `Bearer ${resolved.auth.apiKey}`,
@@ -659,7 +666,7 @@ async function loadCodex(ctx: ExtensionContext, signal: AbortSignal): Promise<Pr
   const providerBaseUrl = ctx.modelRegistry.getProvider?.("openai-codex")?.baseUrl;
   const baseUrl = resolved.auth.baseUrl || providerBaseUrl || CODEX_FALLBACK_BASE_URL;
   const result = await requestJson(codexUsageUrl(baseUrl), headers, signal);
-  if (result.kind === "error") return result;
+  if (result.kind === "error") return result.message === "HTTP 401" ? CODEX_LOGIN : result;
   const windows = parseCodexUsage(result.payload);
   const credits = parseCodexCredits(result.payload);
   if (!windows && credits === undefined) return { kind: "error", message: "malformed response" };
